@@ -165,7 +165,7 @@ def relay(left: socket.socket, right: socket.socket) -> None:
     sockets = [left, right]
     while True:
         readable, _, errored = select.select(sockets, [], sockets, 120)
-        if errored:
+        if errored or not readable:
             return
         for source in readable:
             target = right if source is left else left
