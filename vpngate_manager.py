@@ -78,8 +78,8 @@ import vpn_utils
 import proxy_server
 
 API_URL = "https://www.vpngate.net/api/iphone/"
-FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "960"))
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "960"))
+FETCH_INTERVAL_SECONDS = int(os.environ.get("FETCH_INTERVAL_SECONDS", "1260"))
+CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1260"))
 TARGET_VALID_NODES = int(os.environ.get("TARGET_VALID_NODES", "3"))
 MAX_SCAN_ROWS = int(os.environ.get("MAX_SCAN_ROWS", "300"))
 OPENVPN_TEST_TIMEOUT_SECONDS = int(os.environ.get("OPENVPN_TEST_TIMEOUT_SECONDS", "35"))
@@ -171,7 +171,12 @@ def load_ui_config() -> dict[str, Any]:
             "secret_path": "EJsW2EeBo9lY",
             "password": "",
             "host": "::",
-            "port": 8787
+            "port": 8787,
+            "routing_mode": "auto",
+            "force_country": "",
+            "routing_ip_type": "all",
+            "connection_enabled": True,
+            "fixed_node_id": ""
         }
         updated = False
         if auth_file.exists():
@@ -179,6 +184,9 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
+                for key in ["routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id"]:
+                    if key not in data:
+                        updated = True
             except Exception:
                 pass
         
@@ -292,6 +300,9 @@ def get_state() -> dict[str, Any]:
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
+    state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
+    state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
+    state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     
     return state
 
@@ -846,7 +857,11 @@ def active_openvpn_running() -> bool:
 def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     available_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "available" or n.get("active")],
-        key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score")))
+        key=lambda n: (
+            0 if n.get("ip_type") in ("residential", "mobile") else 1,
+            parse_int(n.get("latency_ms")) or 999999,
+            -parse_int(n.get("score"))
+        )
     )
     untested_nodes = sorted(
         [n for n in nodes if n.get("probe_status") == "not_checked" and not n.get("active")],
@@ -1008,7 +1023,8 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(to_test))) as executor:
+    max_workers = min(80, max(1, len(to_test)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
             nid = futures[future]
@@ -1040,20 +1056,16 @@ def auto_switch_node(attempt: int = 0) -> None:
         return
         
     ui_cfg = load_ui_config()
+    connection_enabled = ui_cfg.get("connection_enabled", True)
+    if not connection_enabled:
+        print("[自动切换] 连接已禁用，不进行自动切换。", flush=True)
+        return
+
     routing_mode = ui_cfg.get("routing_mode", "auto")
     target_country = ui_cfg.get("force_country", "")
 
     if routing_mode == "fixed_ip":
-        print("[自动切换] 当前处于固定 IP 模式，不进行自动切换。", flush=True)
-        if active_openvpn_node_id:
-            if not active_openvpn_running():
-                print(f"[自动切换] 固定 IP 模式检测到连接已断开，尝试重新连接原节点: {active_openvpn_node_id}", flush=True)
-                def reconnect_bg():
-                    try:
-                        connect_node(active_openvpn_node_id)
-                    except Exception as e:
-                        print(f"[自动切换] 重新连接固定节点失败: {e}", flush=True)
-                threading.Thread(target=reconnect_bg, daemon=True).start()
+        print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
         return
 
     # Find the next best available node
@@ -1067,6 +1079,13 @@ def auto_switch_node(attempt: int = 0) -> None:
         
         if routing_mode == "fixed_region" and target_country:
             candidates = [n for n in candidates if n.get("country") == target_country]
+            
+        # Apply routing_ip_type filter
+        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+        if routing_ip_type == "residential":
+            candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
+        elif routing_ip_type == "hosting":
+            candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
             
         candidates.sort(key=lambda n: (parse_int(n.get("latency_ms")) or 999999, -parse_int(n.get("score"))))
         
@@ -1117,6 +1136,16 @@ def connect_node(node_id: str) -> str:
         
     try:
         log_to_json("INFO", "VPN", f"开始连接节点: {node_id}")
+        
+        ui_cfg = load_ui_config()
+        ui_cfg["connection_enabled"] = True
+        if ui_cfg.get("routing_mode") == "fixed_ip":
+            ui_cfg["fixed_node_id"] = node_id
+        auth_file = DATA_DIR / "ui_auth.json"
+        with lock:
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
+            auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            
         nodes = read_json(NODES_FILE, [])
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
@@ -1215,16 +1244,20 @@ def maintain_valid_nodes(force: bool = False) -> str:
             with lock:
                 stop_active_openvpn()
         elif not active_openvpn_running():
-            has_active_id = False
-            with lock:
-                if active_openvpn_node_id:
-                    has_active_id = True
-                    stop_active_openvpn()
-            if has_active_id:
-                print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
-                is_connecting = False
-                auto_switch_node()
-                is_connecting = True
+            ui_cfg = load_ui_config()
+            routing_mode = ui_cfg.get("routing_mode", "auto")
+            connection_enabled = ui_cfg.get("connection_enabled", True)
+            if connection_enabled and routing_mode != "fixed_ip":
+                has_active_id = False
+                with lock:
+                    if active_openvpn_node_id:
+                        has_active_id = True
+                        stop_active_openvpn()
+                if has_active_id:
+                    print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
+                    is_connecting = False
+                    auto_switch_node()
+                    is_connecting = True
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
@@ -1273,22 +1306,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         
             write_json(NODES_FILE, merged)
 
-        # Test the first 10 non-active nodes from the new list
+        # Test all non-active nodes from the list
         with lock:
             current_nodes = read_json(NODES_FILE, [])
-            ui_cfg = load_ui_config()
-            routing_mode = ui_cfg.get("routing_mode", "auto")
-            target_country = ui_cfg.get("force_country", "")
-            
-            if routing_mode == "fixed_region" and target_country:
-                to_test = [n for n in current_nodes if not n.get("active") and n.get("country") == target_country][:10]
-            else:
-                to_test = [n for n in current_nodes if not n.get("active")][:10]
-                
+            to_test = [n for n in current_nodes if not n.get("active")]
             to_test_ids = [n["id"] for n in to_test]
             
-        print(f"[维护线程] 正在检测新获取列表的前 10 个节点: {to_test_ids}", flush=True)
-        set_state(is_connecting=True, last_check_message="正在并发检测筛选可用节点，这可能需要 5-30 秒...")
+        print(f"[维护线程] 正在并发检测列表中所有节点，共 {len(to_test_ids)} 个...", flush=True)
+        set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
         test_multiple_nodes(to_test_ids)
         
         is_connecting = False
@@ -1297,19 +1322,25 @@ def maintain_valid_nodes(force: bool = False) -> str:
             merged = read_json(NODES_FILE, [])
             if not active_openvpn_running():
                 ui_cfg = load_ui_config()
-                routing_mode = ui_cfg.get("routing_mode", "auto")
-                target_country = ui_cfg.get("force_country", "")
-                
-                if routing_mode == "fixed_ip":
-                    if active_openvpn_node_id:
-                        auto_switch_node()
-                else:
-                    available_candidates = [n for n in merged if n.get("probe_status") == "available"]
-                    if routing_mode == "fixed_region" and target_country:
-                        available_candidates = [n for n in available_candidates if n.get("country") == target_country]
+                connection_enabled = ui_cfg.get("connection_enabled", True)
+                if connection_enabled:
+                    routing_mode = ui_cfg.get("routing_mode", "auto")
+                    target_country = ui_cfg.get("force_country", "")
                     
-                    if available_candidates:
-                        auto_switch_node()
+                    if routing_mode != "fixed_ip":
+                        available_candidates = [n for n in merged if n.get("probe_status") == "available"]
+                        if routing_mode == "fixed_region" and target_country:
+                            available_candidates = [n for n in available_candidates if n.get("country") == target_country]
+                        
+                        # Apply routing_ip_type filter for auto-connect
+                        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+                        if routing_ip_type == "residential":
+                            available_candidates = [n for n in available_candidates if n.get("ip_type") in ("residential", "mobile")]
+                        elif routing_ip_type == "hosting":
+                            available_candidates = [n for n in available_candidates if n.get("ip_type") == "hosting"]
+                        
+                        if available_candidates:
+                            auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         message = f"Fetched {len(candidates)} nodes. Tested first 10 nodes."
@@ -2507,6 +2538,20 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
+    <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
+      <label for="header_routing_country" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">出站国家:</label>
+      <select id="header_routing_country" style="background: transparent; border: none; color: var(--text-primary); outline: none; cursor: pointer; font-size: 13px; font-weight: 600; padding: 0;">
+        <option value="">智能路由 / 所有</option>
+      </select>
+    </div>
+    <div class="routing-select-wrapper" style="display: inline-flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.06); border: 1px solid var(--border-color); padding: 0 12px; border-radius: 8px; font-size: 13px; height: 38px;">
+      <label for="header_routing_ip_type" style="color: var(--text-secondary); font-weight: 500; white-space: nowrap;">IP类型:</label>
+      <select id="header_routing_ip_type" style="background: transparent; border: none; color: var(--text-primary); outline: none; cursor: pointer; font-size: 13px; font-weight: 600; padding: 0;">
+        <option value="all">所有IP类型</option>
+        <option value="residential">仅静态住宅IP</option>
+        <option value="hosting">仅机房IP</option>
+      </select>
+    </div>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -2570,6 +2615,11 @@ INDEX_HTML = r"""<!doctype html>
     <select id="country_filter">
       <option value="">所有国家</option>
     </select>
+    <select id="ip_type_filter">
+      <option value="">所有IP类型</option>
+      <option value="residential">住宅IP</option>
+      <option value="hosting">机房IP</option>
+    </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
     <button id="btn_batch_test" class="btn-primary" style="height: 42px; padding: 0 20px; font-weight: 600; background: var(--primary-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -2597,7 +2647,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
     
     <!-- 分页控制栏 -->
-    <div class="pagination-container" style="padding: 16px; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
+    <div class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
       <div style="font-size: 13px; color: var(--text-secondary);">
         显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
       </div>
@@ -2870,7 +2920,7 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
 let currentPage = 1;
-const pageSize = 11;
+const pageSize = 99999;
 let currentPageNodes = [];
 
 const $=id=>document.getElementById(id);
@@ -2995,10 +3045,19 @@ function updateCountryFilter() {
 function getFilteredNodes() {
   const q = $("search").value.toLowerCase();
   const selectedCountry = $("country_filter").value;
+  const selectedIpType = $("ip_type_filter").value;
   return nodes.filter(n => {
     if (!n) return false;
     if (selectedCountry && n.country !== selectedCountry) {
       return false;
+    }
+    if (selectedIpType) {
+      if (selectedIpType === "residential" && !["residential", "mobile"].includes(n.ip_type)) {
+        return false;
+      }
+      if (selectedIpType === "hosting" && n.ip_type !== "hosting") {
+        return false;
+      }
     }
     const searchStr = [
       n.country || "", n.country_short || "", n.ip || "", n.remote_host || "", n.proto || "",
@@ -3396,6 +3455,79 @@ $("btn_batch_test").onclick = async () => {
   }
 };
 
+function updateHeaderRoutingControls() {
+  const selectCountry = $("header_routing_country");
+  const selectIpType = $("header_routing_ip_type");
+  if (!selectCountry || !selectIpType) return;
+  
+  // 1. Countries list
+  const countries = Array.from(new Set(nodes.map(n => n.country).filter(Boolean))).sort();
+  const currentOptions = Array.from(selectCountry.options).map(o => o.value).filter(v => v && v !== "fixed_ip_mode");
+  
+  const rebuild = JSON.stringify(countries) !== JSON.stringify(currentOptions);
+  if (rebuild) {
+    selectCountry.innerHTML = '<option value="">智能路由 / 所有</option>' + 
+      countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  }
+  
+  // 2. Set value
+  if (state.routing_mode === "fixed_ip") {
+    if (!selectCountry.querySelector('option[value="fixed_ip_mode"]')) {
+      const opt = document.createElement("option");
+      opt.value = "fixed_ip_mode";
+      opt.textContent = "固定 IP 模式";
+      opt.disabled = true;
+      selectCountry.appendChild(opt);
+    }
+    selectCountry.value = "fixed_ip_mode";
+  } else if (state.routing_mode === "fixed_region") {
+    selectCountry.value = state.force_country || "";
+  } else {
+    selectCountry.value = "";
+  }
+  
+  selectIpType.value = state.routing_ip_type || "all";
+}
+
+async function saveHeaderRouting() {
+  const selectCountry = $("header_routing_country");
+  const selectIpType = $("header_routing_ip_type");
+  
+  let routingMode = "auto";
+  let forceCountry = selectCountry.value;
+  
+  if (forceCountry === "fixed_ip_mode") {
+    routingMode = "fixed_ip";
+    forceCountry = state.force_country || "";
+  } else if (forceCountry) {
+    routingMode = "fixed_region";
+  } else {
+    routingMode = "auto";
+  }
+  
+  const routingIpType = selectIpType.value;
+  
+  try {
+    const response = await fetch("./api/update_routing", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        routing_mode: routingMode,
+        force_country: forceCountry,
+        routing_ip_type: routingIpType
+      })
+    });
+    const result = await response.json();
+    if (result.ok) {
+      load();
+    } else {
+      alert("更新路由失败: " + result.error);
+    }
+  } catch (e) {
+    alert("更新出站路由网络请求失败");
+  }
+}
+
 async function load(){
   const r=await fetch("./api/nodes"); 
   const d=await r.json(); 
@@ -3404,6 +3536,7 @@ async function load(){
   
   stableSortNodes();
   updateCountryFilter();
+  updateHeaderRoutingControls();
   render();
 
   if (state.is_connecting) {
@@ -3413,6 +3546,9 @@ async function load(){
 
 $("search").oninput=()=>{ currentPage = 1; render(); };
 $("country_filter").onchange=()=>{ currentPage = 1; render(); };
+$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
+$("header_routing_country").onchange = saveHeaderRouting;
+$("header_routing_ip_type").onchange = saveHeaderRouting;
 
 $("refresh").onclick=async()=>{ 
   $("refresh").disabled=true; 
@@ -4066,15 +4202,17 @@ def background_proxy_checker() -> None:
 
                 # If we intended to have an active VPN node but proxy failed, trigger auto-switch
                 if active_openvpn_node_id:
-                    with lock:
-                        nodes = read_json(NODES_FILE, [])
-                        active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
-                        if active_node:
-                            mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
-                            active_node["probe_status"] = "unavailable"
-                            write_json(NODES_FILE, nodes)
-                    
-                    auto_switch_node()
+                    ui_cfg = load_ui_config()
+                    routing_mode = ui_cfg.get("routing_mode", "auto")
+                    if routing_mode != "fixed_ip":
+                        with lock:
+                            nodes = read_json(NODES_FILE, [])
+                            active_node = next((n for n in nodes if n.get("id") == active_openvpn_node_id), None)
+                            if active_node:
+                                mark_blacklisted(active_node, f"代理连通性检测失败: {error_msg}")
+                                active_node["probe_status"] = "unavailable"
+                                write_json(NODES_FILE, nodes)
+                        auto_switch_node()
         except Exception as e:
             print(f"[错误] 代理后台检测发生异常: {e}", flush=True)
             log_to_json("ERROR", "Proxy", f"检测守护线程发生异常: {e}")
@@ -4508,14 +4646,19 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
+                routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if routing_ip_type not in ("all", "residential", "hosting"):
+                    self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
                 
                 ui_cfg = load_ui_config()
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
+                ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg.pop("enable_force_country", None)
                 
                 auth_file = DATA_DIR / "ui_auth.json"
@@ -4550,6 +4693,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
         elif effective_path == "/api/disconnect":
             try:
+                ui_cfg = load_ui_config()
+                ui_cfg["connection_enabled"] = False
+                auth_file = DATA_DIR / "ui_auth.json"
+                with lock:
+                    DATA_DIR.mkdir(exist_ok=True, parents=True)
+                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                
                 stop_active_openvpn()
                 with lock:
                     nodes = read_json(NODES_FILE, [])
