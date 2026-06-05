@@ -176,7 +176,8 @@ def load_ui_config() -> dict[str, Any]:
             "force_country": "",
             "routing_ip_type": "all",
             "connection_enabled": True,
-            "fixed_node_id": ""
+            "fixed_node_id": "",
+            "favorite_node_ids": []
         }
         updated = False
         if auth_file.exists():
@@ -184,7 +185,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id"]:
+                for key in ["routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -303,6 +304,7 @@ def get_state() -> dict[str, Any]:
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
+    state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     
     return state
 
@@ -1116,6 +1118,9 @@ def auto_switch_node(attempt: int = 0) -> None:
                 if n.get("country") == target_country 
                 or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
             ]
+        if routing_mode == "favorites":
+            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+            candidates = [n for n in candidates if n.get("id") in fav_ids]
             
         # Apply routing_ip_type filter
         routing_ip_type = ui_cfg.get("routing_ip_type", "all")
@@ -1363,14 +1368,36 @@ def maintain_valid_nodes(force: bool = False) -> str:
             to_test = [n for n in current_nodes if not n.get("active")]
             to_test_ids = [n["id"] for n in to_test]
             
-        print(f"[维护线程] 正在并发检测列表中所有节点，共 {len(to_test_ids)} 个...", flush=True)
+        msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
+        print(f"[周期检测] {msg}", flush=True)
+        log_to_json("INFO", "Main", msg)
+        
         set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
         test_multiple_nodes(to_test_ids)
-        
         is_connecting = False
         
         with lock:
             merged = read_json(NODES_FILE, [])
+            
+            # Identify available, unavailable, and active nodes
+            available_nodes = [n["id"] for n in merged if n.get("probe_status") == "available"]
+            unavailable_nodes = [n["id"] for n in merged if n.get("probe_status") == "unavailable"]
+            active_node = next((n["id"] for n in merged if n.get("active")), "无")
+            
+            status_report = (
+                f"周期节点检测完成。实时同步状态: 获取到候选节点共 {len(merged)} 个。 "
+                f"其中【可用节点】{len(available_nodes)} 个: {available_nodes[:15]}...; "
+                f"【不可用节点】{len(unavailable_nodes)} 个; "
+                f"当前【正在正常运行的活动连接节点】为: {active_node}。"
+            )
+            print(f"[周期检测] {status_report}", flush=True)
+            log_to_json("INFO", "Main", status_report)
+            
+            if active_node != "无" and not active_openvpn_running():
+                warn_msg = f"[诊断警告] 活动节点 {active_node} 被标记为活动状态，但 OpenVPN 进程实际并未正常运行！"
+                print(warn_msg, flush=True)
+                log_to_json("WARNING", "Main", warn_msg)
+            
             if not active_openvpn_running():
                 ui_cfg = load_ui_config()
                 connection_enabled = ui_cfg.get("connection_enabled", True)
@@ -1386,6 +1413,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
                                 if n.get("country") == target_country 
                                 or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
                             ]
+                        elif routing_mode == "favorites":
+                            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+                            available_candidates = [n for n in available_candidates if n.get("id") in fav_ids]
                         
                         # Apply routing_ip_type filter for auto-connect
                         routing_ip_type = ui_cfg.get("routing_ip_type", "all")
@@ -1417,10 +1447,16 @@ def collector_loop() -> None:
         last_collector_heartbeat = time.time()
         success = False
         try:
+            print("[守护线程] 开始执行节点拉取与可用性检测周期任务...", flush=True)
+            log_to_json("INFO", "Main", "开始执行节点拉取与可用性检测周期任务...")
             res = maintain_valid_nodes(force=False)
             if "没有拉取到新节点" not in res:
                 success = True
+            log_to_json("INFO", "Main", f"周期同步与检测任务完成，结果: {res}")
         except Exception as exc:
+            err_msg = f"周期节点同步任务执行异常: {exc}"
+            print(f"[错误] {err_msg}", flush=True)
+            log_to_json("ERROR", "Main", err_msg)
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
             
         if not active_openvpn_running() and not success:
@@ -2660,6 +2696,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="status_filter">
       <option value="available">可用节点</option>
       <option value="all">全部节点</option>
+      <option value="favorites">收藏节点</option>
       <option value="unavailable">失效节点</option>
     </select>
     <select id="country_filter">
@@ -2672,6 +2709,10 @@ INDEX_HTML = r"""<!doctype html>
     </select>
     <input id="search" placeholder="输入国家、位置、IP、ASN、运营主体等过滤节点..." />
   </section>
+  <div id="favorites_banner" style="display: none; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; color: var(--warning); line-height: 1.5;">
+    ℹ️ <strong>温馨提示</strong>：您可以通过点击节点列表右侧的「☆ 收藏」按钮将心仪节点加入此列表。如果您只希望在收藏列表中自动切换和使用节点，请点击右上角「管理员 -> 代理设置」，将「IP 出站路由模式」设置为「仅用收藏」。
+  </div>
+
   <div class="table-wrapper">
     <div class="table-container">
       <table>
@@ -2682,7 +2723,7 @@ INDEX_HTML = r"""<!doctype html>
             <th>物理位置</th>
             <th>运营主体 / ISP</th>
             <th style="width: 110px;">IP 类型</th>
-            <th style="width: 100px;">操作</th>
+            <th style="width: 180px;">操作</th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -2780,6 +2821,7 @@ INDEX_HTML = r"""<!doctype html>
               <option value="auto">自动配置 (智能切换，最稳定)</option>
               <option value="fixed_ip">固定 IP (永不自动换 IP)</option>
               <option value="fixed_region">固定地区 (锁定特定国家节点)</option>
+              <option value="favorites">仅用收藏 (只在收藏的节点中切换)</option>
             </select>
           </div>
           
@@ -3118,6 +3160,9 @@ function getFilteredNodes() {
     if (selectedStatus === "unavailable" && (n.probe_status !== "unavailable" || n.active)) {
       return false;
     }
+    if (selectedStatus === "favorites" && (!state.favorite_node_ids || !state.favorite_node_ids.includes(n.id))) {
+      return false;
+    }
     const searchStr = [
       n.country || "", n.country_short || "", n.ip || "", n.remote_host || "", n.proto || "",
       translateQuality(n.quality), translateIpType(n.ip_type), n.location || "", n.owner || "", n.as_name || ""
@@ -3277,6 +3322,10 @@ function render(){
     }
   }
 
+  const isFavoritesFilter = $("status_filter").value === "favorites";
+  const banner = $("favorites_banner");
+  if (banner) banner.style.display = isFavoritesFilter ? "block" : "none";
+
   // Pagination calculation
   const totalPages = Math.ceil(shown.length / pageSize) || 1;
   if (currentPage > totalPages) currentPage = totalPages;
@@ -3307,11 +3356,17 @@ function render(){
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
       
       // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
+      // Connect button is disabled if probe status is "unavailable" and not already active, or if we are already connecting
       const isUnavailable = n.probe_status === "unavailable";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
         : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
+      const isFav = state.favorite_node_ids && state.favorite_node_ids.includes(n.id);
+      const favBtn = isFav 
+        ? `<button class="test-btn" style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">★ 已收藏</button>`
+        : `<button class="test-btn" style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">☆ 收藏</button>`;
+
       return `<tr ${rowClass}>
         <td><span class="badge ${badgeClass}">${badgeText}</span></td>
         <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
@@ -3320,6 +3375,7 @@ function render(){
         <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(translateIpType(n.ip_type))}">${esc(translateIpType(n.ip_type))}</td>
         <td>
           <div class="table-actions">
+            ${favBtn}
             ${connectBtn}
           </div>
         </td>
@@ -3377,6 +3433,24 @@ async function testNode(btn, id, event){
   } finally {
     testingNodeIds.delete(id);
     render();
+  }
+}
+
+async function toggleFavorite(id, event) {
+  if (event) event.stopPropagation();
+  try {
+    const response = await fetch("./api/toggle_favorite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id })
+    });
+    const result = await response.json();
+    if (result.ok) {
+      state.favorite_node_ids = result.favorite_node_ids || [];
+      render();
+    }
+  } catch (e) {
+    console.error("切换收藏失败", e);
   }
 }
 
@@ -3578,6 +3652,12 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
     warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，且后台仅并发测速该国家的节点。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
+  } else if (mode === "favorites") {
+    countryGroup.style.display = "none";
+    warningDiv.style.color = "var(--warning)";
+    warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
+    warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
+    warningDiv.innerHTML = `⚠️ <strong>仅用收藏</strong>：只连接和切换您收藏的节点。如果所有收藏的节点均失效，系统不会自动切换到未收藏的节点。请确保收藏列表中有足够多且可用的节点。`;
   } else if (mode === "fixed_ip") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -4589,7 +4669,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "安全后缀仅能由英文字母和数字组成"}, HTTPStatus.BAD_REQUEST)
                     return
                 
-                if routing_mode not in ("auto", "fixed_ip", "fixed_region"):
+                if (routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites")):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
@@ -4637,7 +4717,7 @@ class Handler(BaseHTTPRequestHandler):
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 
-                if routing_mode not in ("auto", "fixed_ip", "fixed_region"):
+                if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
@@ -4656,6 +4736,33 @@ class Handler(BaseHTTPRequestHandler):
                     auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
                 
                 self.send_json({"ok": True, "message": "出站路由配置更新成功，已即时生效！"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        elif effective_path == "/api/toggle_favorite":
+            try:
+                length = parse_int(self.headers.get("Content-Length"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                node_id = str(payload.get("id") or "").strip()
+                
+                ui_cfg = load_ui_config()
+                fav_ids = ui_cfg.get("favorite_node_ids", [])
+                if not isinstance(fav_ids, list):
+                    fav_ids = []
+                
+                if node_id in fav_ids:
+                    fav_ids.remove(node_id)
+                else:
+                    fav_ids.append(node_id)
+                
+                ui_cfg["favorite_node_ids"] = fav_ids
+                auth_file = DATA_DIR / "ui_auth.json"
+                with lock:
+                    DATA_DIR.mkdir(exist_ok=True, parents=True)
+                    auth_file.write_text(json.dumps(ui_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                
+                self.send_json({"ok": True, "favorite_node_ids": fav_ids})
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
