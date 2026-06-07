@@ -350,8 +350,8 @@ def check_openvpn_process():
             if pid_dir.isdigit():
                 try:
                     with open(os.path.join('/proc', pid_dir, 'cmdline'), 'r') as f:
-                        cmd = f.read().split('\x00')[0]
-                        if 'openvpn' in cmd:
+                        cmd = f.read().replace('\x00', ' ')
+                        if 'openvpn' in cmd and ('/opt/aimilivpn/vpngate_data' in cmd or '/opt/aimilivpn/vpngate_data/configs' in cmd):
                             return True
                 except Exception:
                     continue
@@ -466,15 +466,16 @@ def print_status():
         proxy_port = proxy_port
     
     if proxy_host == "::":
-        socks_addr = "127.0.0.1"
+        proxy_addr = "127.0.0.1"
     elif ":" in proxy_host:
-        socks_addr = f"[{proxy_host}]"
+        proxy_addr = f"[{proxy_host}]"
     else:
-        socks_addr = proxy_host
+        proxy_addr = proxy_host
 
     print_line("【使用方法】")
-    print_line(f"  export http_proxy=socks5://{socks_addr}:{proxy_port}")
-    print_line(f"  export https_proxy=socks5://{socks_addr}:{proxy_port}")
+    print_line(f"  export http_proxy=http://{proxy_addr}:{proxy_port}")
+    print_line(f"  export https_proxy=http://{proxy_addr}:{proxy_port}")
+    print_line(f"  # 也可用于 SOCKS5: socks5://{proxy_addr}:{proxy_port}")
     print_line("=======================================================")
 
 def run_service_cmd(cmd):
@@ -678,6 +679,10 @@ def configure_port():
                 if val:
                     port = int(val)
                     if 1 <= port <= 65535:
+                        if port == int(cfg.get('proxy_port', 7928)):
+                            print("错误: 网页管理端口不能与代理出站端口相同。")
+                            time.sleep(2)
+                            continue
                         cfg['port'] = port
                         save_ui_cfg(cfg)
                         print(f"网页管理端口已更新为: {port}")
@@ -694,6 +699,10 @@ def configure_port():
                 if val:
                     port = int(val)
                     if 1024 <= port <= 65535:
+                        if port == int(cfg.get('port', 8787)):
+                            print("错误: 代理出站端口不能与网页管理端口相同。")
+                            time.sleep(2)
+                            continue
                         cfg['proxy_port'] = port
                         save_ui_cfg(cfg)
                         print(f"代理出站端口已更新为: {port}")
@@ -1040,19 +1049,24 @@ while True:
         done
     fi
 
-    # Write config JSON
-    python3 -c "
+    # Write config JSON. Values are passed as argv to avoid breaking Python code
+    # when username/password contain quotes, backslashes, or shell metacharacters.
+    python3 - "$AUTH_FILE" "$UI_PORT" "$SECRET_PATH" "$UI_USERNAME" "$UI_PASSWORD" <<'PY'
 import json
+import sys
+
+auth_file, ui_port, secret_path, username, password = sys.argv[1:6]
 cfg = {
-    'host': '::',
-    'port': int('$UI_PORT'),
-    'secret_path': '$SECRET_PATH',
-    'username': '$UI_USERNAME',
-    'password': '$UI_PASSWORD'
+    "host": "::",
+    "port": int(ui_port),
+    "proxy_port": 7928,
+    "secret_path": secret_path,
+    "username": username,
+    "password": password,
 }
-with open('$AUTH_FILE', 'w', encoding='utf-8') as f:
+with open(auth_file, "w", encoding="utf-8") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)
-"
+PY
 fi
 
 # 8. Start service
@@ -1132,12 +1146,14 @@ SECRET_PATH="EJsW2EeBo9lY"
 USERNAME="未配置"
 PASSWORD="未配置"
 UI_PORT=8787
+PROXY_PORT=7928
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 if [ -f "$AUTH_FILE" ]; then
     SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', 'EJsW2EeBo9lY'))" 2>/dev/null || echo "EJsW2EeBo9lY")
     USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
     PASSWORD=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('password', '未配置'))" 2>/dev/null || echo "未配置")
     UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
+    PROXY_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_port', 7928))" 2>/dev/null || echo "7928")
 fi
 
 # Get VPS public IP
@@ -1158,7 +1174,7 @@ if [ -n "$PUBLIC_IPV6" ]; then
 fi
 echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
 echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:7928/${PLAIN}  或  ${BLUE}http://[::1]:7928/${PLAIN}"
+echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}  或  ${BLUE}http://[::1]:${PROXY_PORT}/${PLAIN}"
 echo -e " --------------------------------------------------------"
 echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
 echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"

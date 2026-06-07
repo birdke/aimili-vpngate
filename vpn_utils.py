@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent
-DATA_DIR = ROOT_DIR / "vpngate_data"
+DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
 
 ip_cache_lock = threading.RLock()
@@ -92,51 +92,84 @@ def _safe_int(val: Any, default: int = 0) -> int:
     except (ValueError, TypeError):
         return default
 
+def parse_proxy_endpoint(value: str, default_port: int) -> tuple[str | None, int | None]:
+    value = value.strip()
+    if not value:
+        return None, None
+    if "://" in value:
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.hostname:
+            return parsed.hostname, parsed.port or default_port
+        return None, None
+    if value.startswith("["):
+        host_part, sep, rest = value.partition("]")
+        host = host_part.lstrip("[")
+        port = default_port
+        if sep and rest.startswith(":"):
+            port = _safe_int(rest[1:], default_port)
+        return host or None, port
+    if value.count(":") == 1:
+        host, _, port_text = value.rpartition(":")
+        return host or None, _safe_int(port_text, default_port)
+    return value, default_port
+
+def _proxy_config_from_env(env_name: str, forced_type: str | None = None) -> tuple[str, str, int, str | None, str | None] | None:
+    val = os.environ.get(env_name)
+    if not val:
+        return None
+    if "://" in val:
+        try:
+            parsed = urllib.parse.urlsplit(val)
+        except Exception:
+            return None
+        if not parsed.hostname:
+            return None
+        ptype = forced_type or ("socks" if parsed.scheme.startswith("socks") else "http")
+        username = urllib.parse.unquote(parsed.username) if parsed.username is not None else None
+        password = urllib.parse.unquote(parsed.password or "") if parsed.username is not None else None
+        return ptype, parsed.hostname, parsed.port or 10808, username, password
+    host, port = parse_proxy_endpoint(val, 10808)
+    if host and port:
+        return forced_type or "http", host, port, None, None
+    return None
+
+def get_upstream_proxy_config() -> tuple[str | None, str | None, int | None, str | None, str | None]:
+    for env_name, forced_type in [
+        ("OPENVPN_UPSTREAM_SOCKS", "socks"),
+        ("OPENVPN_UPSTREAM_HTTP", "http"),
+        ("http_proxy", None),
+        ("HTTP_PROXY", None),
+        ("https_proxy", None),
+        ("HTTPS_PROXY", None),
+    ]:
+        cfg = _proxy_config_from_env(env_name, forced_type)
+        if cfg:
+            ptype, host, port, username, password = cfg
+            return ptype, host, port, username, password
+    return None, None, None, None, None
+
 def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
     """
     Returns (proxy_type, host, port) from environment variables.
     proxy_type is 'socks' or 'http'.
     """
-    socks_env = os.environ.get("OPENVPN_UPSTREAM_SOCKS")
-    if socks_env:
-        if "://" in socks_env:
-            parsed = urllib.parse.urlsplit(socks_env)
-            if parsed.hostname and parsed.port:
-                return "socks", parsed.hostname, parsed.port
-        else:
-            parts = socks_env.split(":")
-            if len(parts) == 2:
-                return "socks", parts[0], _safe_int(parts[1], 10808)
-            elif len(parts) == 1:
-                return "socks", parts[0], 10808
+    ptype, host, port, _, _ = get_upstream_proxy_config()
+    return ptype, host, port
 
-    http_env = os.environ.get("OPENVPN_UPSTREAM_HTTP")
-    if http_env:
-        if "://" in http_env:
-            parsed = urllib.parse.urlsplit(http_env)
-            if parsed.hostname and parsed.port:
-                return "http", parsed.hostname, parsed.port
-        else:
-            parts = http_env.split(":")
-            if len(parts) == 2:
-                return "http", parts[0], _safe_int(parts[1], 10808)
-            elif len(parts) == 1:
-                return "http", parts[0], 10808
+def get_upstream_proxy_auth() -> tuple[str | None, str | None]:
+    """
+    Returns optional (username, password) for the configured upstream proxy.
+    Supports credentials embedded in proxy URLs and explicit env vars.
+    """
+    _, _, _, username, password = get_upstream_proxy_config()
+    if username is not None:
+        return username, password or ""
 
-    for env_name in ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"]:
-        val = os.environ.get(env_name)
-        if not val:
-            continue
-        if "://" in val:
-            parsed = urllib.parse.urlsplit(val)
-            ptype = "socks" if parsed.scheme.startswith("socks") else "http"
-            if parsed.hostname and parsed.port:
-                return ptype, parsed.hostname, parsed.port
-        else:
-            parts = val.split(":")
-            if len(parts) == 2:
-                return "http", parts[0], _safe_int(parts[1], 10808)
-    return None, None, None
+    user = os.environ.get("OPENVPN_UPSTREAM_USER") or os.environ.get("OPENVPN_UPSTREAM_USERNAME")
+    password = os.environ.get("OPENVPN_UPSTREAM_PASS") or os.environ.get("OPENVPN_UPSTREAM_PASSWORD")
+    if user is not None:
+        return user, password or ""
+    return None, None
 
 def is_config_tcp(config_text: str) -> bool:
     try:
@@ -338,7 +371,7 @@ def load_ip_cache() -> dict[str, dict[str, Any]]:
 def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
     with ip_cache_lock:
         try:
-            DATA_DIR.mkdir(exist_ok=True)
+            DATA_DIR.mkdir(exist_ok=True, parents=True)
             IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -657,4 +690,4 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
             except Exception:
                 pass
 
-    return None
+    return None
