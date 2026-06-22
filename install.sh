@@ -99,6 +99,12 @@ else
     if [ -d "${INSTALL_DIR}" ]; then
         echo -e "  -> 目录 ${INSTALL_DIR} 已存在，正在更新并强制覆盖本地源码..."
         cd "${INSTALL_DIR}"
+        if git remote get-url origin >/dev/null 2>&1; then
+            echo -e "  -> 正在将 origin 切换为 ${GITHUB_URL} ..."
+            git remote set-url origin "${GITHUB_URL}"
+        else
+            git remote add origin "${GITHUB_URL}"
+        fi
         git fetch --all || true
         git checkout "${DEPLOY_BRANCH}" || git checkout -b "${DEPLOY_BRANCH}" "origin/${DEPLOY_BRANCH}" || true
         echo -e "  -> 正在强制重置本地源码至 origin/${DEPLOY_BRANCH} ..."
@@ -578,27 +584,12 @@ def update_service():
 def uninstall_service():
     confirm = input("确定要完全卸载 AimiliVPN 吗？(y/N): ")
     if confirm.lower() == 'y':
-        print("正在完全卸载 AimiliVPN...", flush=True)
-        stop_service()
-        if shutil.which("systemctl"):
-            subprocess.run(["systemctl", "disable", "aimilivpn.service"])
-            try:
-                os.unlink("/lib/systemd/system/aimilivpn.service")
-            except Exception:
-                pass
-        elif shutil.which("rc-service"):
-            subprocess.run(["rc-update", "del", "aimilivpn"])
-            try:
-                os.unlink("/etc/init.d/aimilivpn")
-            except Exception:
-                pass
-        try:
-            os.unlink("/usr/bin/ml")
-        except Exception:
-            pass
-        subprocess.run(["rm", "-rf", INSTALL_DIR])
-        print("AimiliVPN 已卸载！")
-        sys.exit(0)
+        uninstall_script = os.path.join(INSTALL_DIR, "uninstall.sh")
+        if os.path.isfile(uninstall_script):
+            result = subprocess.run(["bash", uninstall_script, "--yes"])
+            sys.exit(result.returncode)
+        print("未找到新版卸载脚本，请先运行 ml update 后重试。")
+        time.sleep(3)
     else:
         print("已取消卸载。")
         time.sleep(1)
@@ -1079,15 +1070,15 @@ net.ipv4.conf.default.rp_filter = 2
 EOF
     sysctl -p /etc/sysctl.d/99-aimilivpn.conf >/dev/null 2>&1 || true
 else
-    # Fallback to appending to /etc/sysctl.conf
-    if ! grep -q "net.ipv4.conf.all.rp_filter" /etc/sysctl.conf; then
-        echo "" >> /etc/sysctl.conf
-        echo "net.ipv4.conf.all.rp_filter = 2" >> /etc/sysctl.conf
-        echo "net.ipv4.conf.default.rp_filter = 2" >> /etc/sysctl.conf
-    else
-        sed -i 's/net.ipv4.conf.all.rp_filter\s*=\s*[0-9]/net.ipv4.conf.all.rp_filter = 2/g' /etc/sysctl.conf
-        sed -i 's/net.ipv4.conf.default.rp_filter\s*=\s*[0-9]/net.ipv4.conf.default.rp_filter = 2/g' /etc/sysctl.conf
-    fi
+    # Fallback to a clearly marked block so uninstall never alters user-owned settings.
+    sed -i '/^# BEGIN AimiliVPN$/,/^# END AimiliVPN$/d' /etc/sysctl.conf
+    cat >> /etc/sysctl.conf <<EOF
+
+# BEGIN AimiliVPN
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+# END AimiliVPN
+EOF
     sysctl -p >/dev/null 2>&1 || true
 fi
 # Apply to currently active interfaces dynamically (prefer native proc write for BusyBox/Alpine compatibility)

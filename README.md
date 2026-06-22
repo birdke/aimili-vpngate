@@ -42,6 +42,22 @@ bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/ins
 ```
 > 💡 **小贴士**：部署完成后，终端会输出管理网页的专属链接（含随机安全后缀，如 `http://your_vps_ip:8787/u71e9IXp4TPx`）。在终端中输入 `ml` 命令可以随时调出交互式命令行管理菜单。
 
+#### 🧹 彻底卸载或干净重装
+
+下面的命令会删除服务、全部配置/日志/节点缓存、`ml` 命令、策略路由及 API 中继残留，但不会卸载系统共享的 Python、OpenVPN、Git 等软件包：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/uninstall.sh)
+```
+
+确认无需保留任何 AimiliVPN 数据时，可使用非交互模式：
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/uninstall.sh) --yes
+```
+
+卸载完成后重新执行上方一键安装命令，即可进行干净重装。
+
 #### 🌐 在网页配置上游代理
 
 如果 VPNGate 对当前 VPS 返回空 HTML，可以直接在管理后台配置一个可用的 HTTP 或 SOCKS5 上游代理：
@@ -190,6 +206,16 @@ bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/ins
 ```
 
 > 💡 **Quick Note**: Once installed, copy the printed URL from the terminal to access the Web UI. Type the `ml` command in the terminal to summon the interactive CLI management console.
+
+#### 🧹 Clean uninstall or reinstall
+
+This removes the services, all configuration/log/cache data, the `ml` command, policy routing, and API relay remnants. Shared packages such as Python, OpenVPN, and Git are retained:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/uninstall.sh)
+```
+
+Pass `--yes` for a non-interactive purge, then run the one-click installer again for a clean reinstall.
 
 #### 🌐 Configure an upstream proxy in the Web UI
 
