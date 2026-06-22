@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import csv
 import json
 import os
 import queue
@@ -16,6 +15,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -77,6 +77,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 
 import vpn_utils
 import proxy_server
+import vpngate_api
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -104,7 +105,15 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
         return default
     return parsed
 
-API_URL = "https://www.vpngate.net/api/iphone/"
+DEFAULT_API_URL = "https://www.vpngate.net/api/iphone/"
+API_URL = os.environ.get("VPNGATE_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+API_TOKEN = os.environ.get("VPNGATE_API_TOKEN", "").strip()
+API_FETCH_ATTEMPTS = env_int("VPNGATE_API_FETCH_ATTEMPTS", 2, 1, 5)
+API_FAILURE_RETRY_SECONDS = env_int("VPNGATE_API_FAILURE_RETRY_SECONDS", 300, 30)
+API_FAILURE_MAX_RETRY_SECONDS = max(
+    API_FAILURE_RETRY_SECONDS,
+    env_int("VPNGATE_API_FAILURE_MAX_RETRY_SECONDS", 1800, 30),
+)
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
@@ -549,11 +558,15 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
         else:
             request_uri = path
             
+        if "\r" in API_TOKEN or "\n" in API_TOKEN:
+            raise RuntimeError("[ERR_API_TOKEN_INVALID] VPNGATE_API_TOKEN 不能包含换行字符。")
+        api_auth_header = f"Authorization: Bearer {API_TOKEN}\r\n" if API_TOKEN else ""
         req_headers = (
             f"GET {request_uri} HTTP/1.1\r\n"
             f"Host: {domain}\r\n"
             f"User-Agent: Mozilla/5.0 vpngate-openvpn-manager/2.0\r\n"
             f"Accept: text/plain,*/*\r\n"
+            f"{api_auth_header}"
             f"{proxy_basic_auth_header(proxy_user, proxy_pass or '') if ptype == 'http' and not is_https and proxy_user is not None else ''}"
             f"Connection: close\r\n\r\n"
         )
@@ -640,27 +653,28 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
             print(f"[fetch_api_text] 通过代理获取 API 失败: {e}，尝试使用直连/默认系统代理...", flush=True)
             log_to_json("WARNING", "Main", f"使用代理 {ptype}://{phost}:{pport} 获取 API 失败: {e}")
 
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 vpngate-openvpn-manager/2.0",
-            "Accept": "text/plain,*/*",
-        },
-    )
+    try:
+        headers = vpngate_api.build_api_request_headers(
+            "Mozilla/5.0 vpngate-openvpn-manager/2.0",
+            API_TOKEN,
+        )
+    except ValueError as exc:
+        raise RuntimeError("[ERR_API_TOKEN_INVALID] VPNGATE_API_TOKEN 不能包含换行字符。") from exc
+    request = urllib.request.Request(url, headers=headers)
     if url.startswith("https://") and not use_ssl_verify:
         import ssl
         ctx = ssl._create_unverified_context()
         with urllib.request.urlopen(request, timeout=12, context=ctx) as response:
-            return response.read().decode("utf-8", errors="replace")
+            body = response.read(10 * 1024 * 1024 + 1)
     else:
         with urllib.request.urlopen(request, timeout=12) as response:
-            return response.read().decode("utf-8", errors="replace")
+            body = response.read(10 * 1024 * 1024 + 1)
+    if len(body) > 10 * 1024 * 1024:
+        raise RuntimeError("[ERR_API_RESPONSE_TOO_LARGE] API 响应超过 10 MiB 安全限制。")
+    return body.decode("utf-8", errors="replace")
 
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
-    lines = [line for line in text.splitlines() if line and not line.startswith("*")]
-    if lines and lines[0].startswith("#"):
-        lines[0] = lines[0][1:]
-    return list(csv.DictReader(lines))
+    return vpngate_api.parse_vpngate_csv(text)
 
 def decode_config(encoded: str) -> str:
     return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
@@ -743,61 +757,65 @@ def fetch_candidates() -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
     
-    # 检查本地是否有节点缓存，以确定最大重试尝试次数
+    # 有缓存时只尝试一次；无缓存的首次启动允许有限重试。
     has_cache = len(cached_nodes()) > 0
-    max_attempts = 1 if has_cache else 2
-    
-    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
-    attempts_targets = [
-        (API_URL, True),
-        (API_URL, False)
-    ]
-    if API_URL.startswith("https://"):
-        attempts_targets.append((API_URL.replace("https://", "http://"), True))
+    max_attempts = 1 if has_cache else API_FETCH_ATTEMPTS
         
     log_to_json("INFO", "Main", "开始拉取官方 API 节点列表...")
     
     last_err = None
-    for url, verify_ssl in attempts_targets:
-        for i in range(max_attempts):
-            if i > 0:
-                time.sleep(1.5)
-            try:
-                msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
-                print(f"[fetch_candidates] {msg}", flush=True)
-                log_to_json("INFO", "Main", msg)
-                api_text = fetch_api_text(url, verify_ssl)
-                rows = parse_vpngate_rows(api_text)
-                for row in rows[:MAX_SCAN_ROWS]:
-                    ip = row.get("IP", "")
-                    if not ip or ip in seen_ips:
-                        continue
-                    encoded = row.get("OpenVPN_ConfigData_Base64", "")
-                    if not encoded:
-                        continue
-                    try:
-                        config_text = decode_config(encoded)
-                        node = row_to_node(row, config_text)
-                    except Exception as row_exc:
-                        print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
-                        log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
-                        continue
-                    entry = blacklist.get(node["id"])
-                    if entry and float(entry.get("until", 0) or 0) > time.time():
-                        continue
-                    candidates.append(node)
-                    seen_ips.add(ip)
-                if candidates:
-                    break
-            except Exception as e:
-                last_err = e
-                print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
-                log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
-        if candidates:
-            break
+    parsed_rows_count = 0
+    for i in range(max_attempts):
+        if i > 0:
+            time.sleep(2)
+        try:
+            msg = f"尝试拉取 {API_URL} (第 {i + 1}/{max_attempts} 次)..."
+            print(f"[fetch_candidates] {msg}", flush=True)
+            log_to_json("INFO", "Main", msg)
+            api_text = fetch_api_text(API_URL, True)
+            rows = parse_vpngate_rows(api_text)
+            parsed_rows_count = len(rows)
+            for row in rows[:MAX_SCAN_ROWS]:
+                ip = row.get("IP", "")
+                if not ip or ip in seen_ips:
+                    continue
+                encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                if not encoded:
+                    continue
+                try:
+                    config_text = decode_config(encoded)
+                    node = row_to_node(row, config_text)
+                except Exception as row_exc:
+                    print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
+                    log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
+                    continue
+                entry = blacklist.get(node["id"])
+                if entry and float(entry.get("until", 0) or 0) > time.time():
+                    continue
+                candidates.append(node)
+                seen_ips.add(ip)
+            if candidates:
+                break
+        except Exception as e:
+            last_err = e
+            print(f"[fetch_candidates] 拉取失败 (URL: {API_URL}): {e}", flush=True)
+            log_to_json("WARNING", "Main", f"拉取失败 (URL: {API_URL}): {e}")
             
     if not candidates:
-        err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
+        if parsed_rows_count:
+            err_code = 1013
+            diag_msg = (
+                f"[ERR_API_ALL_NODES_FILTERED] API 返回 {parsed_rows_count} 条记录，"
+                "但全部被黑名单或配置校验过滤。"
+            )
+        elif isinstance(last_err, vpngate_api.VPNGateAPIResponseError):
+            err_code = 1011
+            diag_msg = str(last_err)
+        elif isinstance(last_err, urllib.error.HTTPError):
+            err_code = 1012
+            diag_msg = f"[ERR_API_HTTP_STATUS] API 返回 HTTP {last_err.code}: {last_err.reason}"
+        else:
+            err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
         full_err_msg = f"获取官方 API 节点最终失败: {last_err} | 诊断结果: {diag_msg}"
         print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
         log_to_json("ERROR", "Main", f"[错误代码 {err_code}] {full_err_msg}")
@@ -1935,6 +1953,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
 def collector_loop() -> None:
     global last_collector_heartbeat
+    consecutive_failures = 0
     while True:
         last_collector_heartbeat = time.time()
         success = False
@@ -1951,8 +1970,16 @@ def collector_loop() -> None:
             log_to_json("ERROR", "Main", err_msg)
             set_state(last_check_at=time.time(), last_check_message=f"check error: {exc}")
             
-        if not active_openvpn_running() and not success:
-            sleep_time = 30
+        if success:
+            consecutive_failures = 0
+            sleep_time = CHECK_INTERVAL_SECONDS
+        elif not active_openvpn_running():
+            consecutive_failures += 1
+            sleep_time = min(
+                API_FAILURE_RETRY_SECONDS * (2 ** min(consecutive_failures - 1, 10)),
+                API_FAILURE_MAX_RETRY_SECONDS,
+            )
+            print(f"[守护线程] 节点拉取失败，{sleep_time} 秒后重试。", flush=True)
         else:
             sleep_time = CHECK_INTERVAL_SECONDS
             

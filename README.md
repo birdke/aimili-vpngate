@@ -2,6 +2,8 @@
 
 Bilingual: [中文](#中文) | [English](#english)
 
+> 本 Fork 由 [birdke](https://github.com/birdke) 维护，基于 [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate)。当前版本新增受限 VPNGate API 中继、严格响应校验和失败退避，适合官方节点 API 对部分 VPS 出口 IP 返回空 HTML 的场景。
+
 ---
 
 <a name="中文"></a>
@@ -22,7 +24,7 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 
 ---
 
-### 📢 官方交流与反馈
+### 📢 上游项目交流与反馈
 [![Telegram](https://img.shields.io/badge/TG交流群-arestemple-2CA5E0?style=flat-square&logo=telegram&logoColor=white)](https://t.me/arestemple)
 [![Forum](https://img.shields.io/badge/交流论坛-339936.xyz-orange?style=flat-square&logo=discourse&logoColor=white)](https://339936.xyz)
 [![YouTube](https://img.shields.io/badge/视频教程-YouTube-red?style=flat-square&logo=youtube&logoColor=white)](https://www.youtube.com/watch?v=s-ATfXR8BpI)
@@ -36,9 +38,56 @@ AimiliVPN 是一款基于官方 VPNGate 开放协议的高性能、零依赖 VPN
 
 #### 🌟 正式稳定版本 (main 分支)
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/install.sh)
 ```
 > 💡 **小贴士**：部署完成后，终端会输出管理网页的专属链接（含随机安全后缀，如 `http://your_vps_ip:8787/u71e9IXp4TPx`）。在终端中输入 `ml` 命令可以随时调出交互式命令行管理菜单。
+
+#### 🌉 使用另一台 VPS 中继节点列表 API
+
+当 VPNGate 对当前 VPS 的出口 IP 返回空 HTML 时，可以在另一台能正常获取 CSV 的 VPS 上运行受限中继。中继只提供节点列表，不会转发 OpenVPN 流量。
+
+在美国 VPS 上：
+
+```bash
+if [ -d /opt/aimilivpn/.git ]; then
+  git -C /opt/aimilivpn pull --ff-only
+else
+  git clone https://github.com/birdke/aimili-vpngate.git /opt/aimilivpn
+fi
+cd /opt/aimilivpn
+read -rp "香港 VPS 公网 IPv4: " HK_IP
+TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+cp deploy/aimilivpn-api-relay.env.example /etc/default/aimilivpn-api-relay
+sed -i "s/replace-with-a-long-random-token/$TOKEN/" /etc/default/aimilivpn-api-relay
+sed -i "s/203.0.113.10/$HK_IP/" /etc/default/aimilivpn-api-relay
+cp deploy/aimilivpn-api-relay.service /etc/systemd/system/
+chmod 600 /etc/default/aimilivpn-api-relay
+systemctl daemon-reload
+systemctl enable --now aimilivpn-api-relay
+curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/iphone/ | head -n 2
+echo "保存此令牌供香港端使用: $TOKEN"
+```
+
+在云防火墙或 UFW 中只允许香港 VPS 访问美国 VPS 的 TCP `8790` 端口。然后在香港 VPS 执行：
+
+```bash
+read -rp "美国 VPS 公网 IP: " US_IP
+read -rsp "美国中继令牌: " RELAY_TOKEN; echo
+touch /etc/default/aimilivpn
+sed -i '/^VPNGATE_API_URL=/d; /^VPNGATE_API_TOKEN=/d' /etc/default/aimilivpn
+printf 'VPNGATE_API_URL=http://%s:8790/api/iphone/\n' "$US_IP" >> /etc/default/aimilivpn
+printf 'VPNGATE_API_TOKEN=%s\n' "$RELAY_TOKEN" >> /etc/default/aimilivpn
+```
+
+重启香港端并观察日志：
+
+```bash
+chmod 600 /etc/default/aimilivpn
+systemctl restart aimilivpn
+journalctl -u aimilivpn -f
+```
+
+> 安全提示：中继不是通用代理，但仍应同时使用令牌和源 IP 防火墙限制。跨公网使用时，推荐再通过 TLS 反向代理或 SSH 隧道保护传输。
 
 ---
 
@@ -112,10 +161,10 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
   - **授权对象/源IP**: `0.0.0.0/0` (允许所有人，或指定您自己的家庭公网 IP 提高安全性)
 
 #### 3. 页面提示 `API Domain Blocked` 且备选节点显示为 0
-* **原因**：您的 VPS DNS 解析异常，或者官方 VPNGate 域名遭防火墙拦截污染，导致无法下载节点列表。
+* **原因**：您的 VPS DNS 解析异常、官方域名被阻断，或者 VPNGate 针对当前 VPS 出口 IP 返回了空 HTML 而不是节点 CSV。
 * **解决办法**：
-  * **设置上游代理**：如果您有其他可用的代理服务，可在网页管理面板中打开“管理员 -> 代理及网络设置”，配置有效的 HTTP/SOCKS5 上游代理，后台会自动通过该代理拉取更新。
-  * **修改 DNS 解析器**：在终端修改 `/etc/resolv.conf`，将域名服务器替换为公共 DNS（如 `nameserver 8.8.8.8` 和 `nameserver 1.1.1.1`）。
+  * 如果请求成功但返回 HTML，请使用上文的 **节点列表 API 中继**；它只中继公开 CSV，不会让 OpenVPN 流量绕行中继 VPS。
+  * 如果日志显示域名无法解析，再检查 `/etc/resolv.conf` 或系统 DNS 配置。不要在 DNS 正常时盲目更换解析器。
 
 #### 4. VPN 已成功连接，但客户端设置代理后无法上网 (无流量)
 * **原因**：部分系统启用了严格的反向路径过滤（`rp_filter`），导致策略路由的入站/出站数据包被系统误判丢弃。
@@ -123,9 +172,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 
 ---
 
-### 🎁 捐赠支持项目开发
+### 🎁 支持上游项目开发
 
-如果您觉得这个项目对您有所帮助，欢迎捐赠支持我们的后续开发与维护：
+以下捐赠地址来自上游项目 README，用于支持原项目后续开发与维护：
 
 * **BNB (BSC / BEP20)**: `0xB6d78c42CEB0687A31B8cfEBE4b51b6eB8953C17`
 * **TRX (TRC20)**: `TSdzCW6JvsrqcppodYjhSrku4mYmDJ9pxf`
@@ -136,6 +185,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 
 <a name="english"></a>
 ## English
+
+> This fork is maintained by [birdke](https://github.com/birdke) and is based on [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate). It adds a restricted VPNGate API relay, strict response validation, and failure backoff for VPS addresses that receive an empty HTML response instead of the node CSV.
 
 AimiliVPN is a high-performance, zero-dependency VPN proxy gateway built entirely using Python's standard library. It parses official VPNGate servers, benchmarks latency, and routes traffic through a built-in dual-protocol (HTTP/SOCKS5) proxy server.
 
@@ -149,7 +200,7 @@ AimiliVPN is a high-performance, zero-dependency VPN proxy gateway built entirel
 | **RackNerd** | Budget deployments, testing, and long-running lightweight services | **6000GB monthly bandwidth**, affordable pricing, and generous specs for value-focused VPS use | [View deals](https://my.racknerd.com/aff.php?aff=18708) |
 
 
-### 📢 Community & Feedback
+### 📢 Upstream Community & Feedback
 - **Telegram Group**: [arestemple](https://t.me/arestemple)
 - **Discussion Forum**: [339936.xyz](https://339936.xyz)
 - **Video Tutorial**: [YouTube Guide](https://www.youtube.com/watch?v=s-ATfXR8BpI)
@@ -163,10 +214,14 @@ Run the corresponding command on your Linux VPS as root:
 
 #### 🌟 Stable Release (main branch)
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/install.sh)
 ```
 
 > 💡 **Quick Note**: Once installed, copy the printed URL from the terminal to access the Web UI. Type the `ml` command in the terminal to summon the interactive CLI management console.
+
+#### 🌉 Relay the node-list API through another VPS
+
+If VPNGate returns an empty HTML page to the gateway VPS, run `vpngate_api_relay.py` on another VPS that can fetch the official CSV. The relay is token-protected, cached, optionally source-IP restricted, and never proxies OpenVPN traffic. See `deploy/aimilivpn-api-relay.service` and `deploy/aimilivpn-api-relay.env.example`; configure the gateway with `VPNGATE_API_URL` and `VPNGATE_API_TOKEN` in `/etc/default/aimilivpn`.
 
 ---
 
@@ -219,14 +274,14 @@ To prevent unauthorized scanning and abuse of the proxy port on the public inter
 * **Solution 2**: **Crucial!** Log in to your cloud provider console (AWS, Aliyun, Oracle Cloud, etc.), locate the **Security Group** for your instance, and add an inbound TCP rule to allow ports `8787` and `7928` from `0.0.0.0/0`.
 
 #### 3. "API Domain Blocked" / Candidate nodes pool is empty (0 nodes)
-* **Reason**: The official VPNGate domain is blocked or DNS resolution failed on your VPS.
-* **Solution**: Add an HTTP/SOCKS5 upstream proxy in the settings panel (Admin -> Proxy Settings), or configure public DNS in `/etc/resolv.conf` (e.g., `nameserver 8.8.8.8`).
+* **Reason**: DNS may be broken, the official domain may be blocked, or VPNGate may return an empty HTML page instead of CSV to the VPS egress address.
+* **Solution**: If HTTP succeeds but returns HTML, use the **node-list API relay** described above. If name resolution fails, inspect the system resolver configuration before changing DNS servers.
 
 ---
 
-### 🎁 Donation Support
+### 🎁 Support Upstream Development
 
-If you find this project helpful, you can support its development and maintenance via donation:
+The following donation addresses are retained from the upstream README and support upstream development and maintenance:
 
 * **BNB (BSC / BEP20)**: `0xB6d78c42CEB0687A31B8cfEBE4b51b6eB8953C17`
 * **TRX (TRC20)**: `TSdzCW6JvsrqcppodYjhSrku4mYmDJ9pxf`

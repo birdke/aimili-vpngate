@@ -47,8 +47,8 @@ echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本
 echo -e "${BLUE}==========================================================${PLAIN}"
 
 # 3. Configure GitHub Repository URL
-# Default to the official repository (baoweise-bot/aimili-vpngate)
-DEFAULT_USER="baoweise-bot"
+# Default to this maintained fork (birdke/aimili-vpngate)
+DEFAULT_USER="birdke"
 DEFAULT_REPO="aimili-vpngate"
 
 # Allow custom repository override via command line arguments
