@@ -163,8 +163,8 @@ def ensure_dirs() -> None:
         except OSError:
             pass
 
-def upstream_proxy_auth_file() -> str | None:
-    username, password = vpn_utils.get_upstream_proxy_auth()
+def upstream_proxy_auth_file(purpose: str = "openvpn") -> str | None:
+    username, password = vpn_utils.get_upstream_proxy_auth(purpose)
     if username is None:
         return None
     try:
@@ -389,6 +389,7 @@ def get_state() -> dict[str, Any]:
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = False
+    state["upstream_proxy"] = vpn_utils.get_upstream_proxy_status()
     
     return state
 
@@ -500,7 +501,7 @@ def fetch_api_text_via_proxy(url: str, ptype: str, phost: str, pport: int, use_s
         s = socket.socket(af, socket.SOCK_STREAM)
         s.settimeout(12)
         s.connect((phost, pport))
-        proxy_user, proxy_pass = vpn_utils.get_upstream_proxy_auth()
+        proxy_user, proxy_pass = vpn_utils.get_upstream_proxy_auth("api")
         if ptype == "socks":
             # SOCKS5 Handshake
             if proxy_user is not None:
@@ -644,7 +645,7 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
     if url is None:
         url = API_URL
     
-    ptype, phost, pport = vpn_utils.get_upstream_proxy()
+    ptype, phost, pport = vpn_utils.get_upstream_proxy("api")
     if ptype and phost and pport:
         try:
             print(f"[fetch_api_text] 监测到上游代理 ({ptype}://{phost}:{pport})，尝试通过代理获取 API...", flush=True)
@@ -907,8 +908,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
     try:
         content = Path(config_file).read_text(encoding="utf-8", errors="replace")
         if vpn_utils.is_config_tcp(content):
-            ptype, host, port = vpn_utils.get_upstream_proxy()
-            auth_file = upstream_proxy_auth_file()
+            ptype, host, port = vpn_utils.get_upstream_proxy("openvpn")
+            auth_file = upstream_proxy_auth_file("openvpn")
             if ptype == "socks" and host and port:
                 command.extend(["--socks-proxy", host, str(port)])
                 if auth_file:
@@ -3184,8 +3185,8 @@ INDEX_HTML = r"""<!doctype html>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content">
-        <a href="https://github.com/baoweise-bot/aimili-vpngate" target="_blank">正式版</a>
-        <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/bate" target="_blank">测试版</a>
+        <a href="https://github.com/birdke/aimili-vpngate" target="_blank">本 Fork</a>
+        <a href="https://github.com/baoweise-bot/aimili-vpngate" target="_blank">上游项目</a>
       </div>
     </div>
     <a href="https://t.me/arestemple" target="_blank" class="btn-telegram">
@@ -3383,6 +3384,61 @@ INDEX_HTML = r"""<!doctype html>
         <div class="form-group" style="margin-bottom: 16px;">
           <label class="form-label" for="net_proxy_port">HTTP/SOCKS5 代理出站端口</label>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
+        </div>
+
+        <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
+          <label style="display:flex; align-items:center; justify-content:space-between; gap:12px; cursor:pointer; margin-bottom:12px;">
+            <span>
+              <strong style="display:block; font-size:13px; color:var(--text-primary);">上游代理</strong>
+              <span style="display:block; margin-top:3px; font-size:11px; color:var(--text-secondary);">用于获取被当前 VPS 出口限制的 VPNGate 节点列表</span>
+            </span>
+            <input type="checkbox" id="net_upstream_enabled" onchange="toggleUpstreamFields()" style="width:18px; height:18px; accent-color:var(--primary);">
+          </label>
+
+          <div id="net_upstream_env_notice" style="display:none; font-size:12px; line-height:1.4; padding:8px 12px; margin-bottom:12px; border-radius:6px; color:var(--warning); background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.18);">
+            当前配置来自环境变量。请在服务配置中移除对应变量后，才能通过网页修改。
+          </div>
+
+          <div id="net_upstream_fields">
+            <div class="form-group" style="margin-bottom:12px;">
+              <label class="form-label" for="net_upstream_type">代理协议</label>
+              <select id="net_upstream_type" class="input-field" onchange="updateUpstreamPortDefault()">
+                <option value="http">HTTP / HTTPS CONNECT</option>
+                <option value="socks">SOCKS5</option>
+              </select>
+            </div>
+
+            <div style="display:grid; grid-template-columns:minmax(0, 2fr) minmax(100px, 1fr); gap:10px;">
+              <div class="form-group" style="margin-bottom:12px;">
+                <label class="form-label" for="net_upstream_host">主机或 IP</label>
+                <input type="text" id="net_upstream_host" class="input-field" maxlength="253" placeholder="proxy.example.com">
+              </div>
+              <div class="form-group" style="margin-bottom:12px;">
+                <label class="form-label" for="net_upstream_port">端口</label>
+                <input type="number" id="net_upstream_port" class="input-field" min="1" max="65535" placeholder="8080">
+              </div>
+            </div>
+
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+              <div class="form-group" style="margin-bottom:12px;">
+                <label class="form-label" for="net_upstream_username">用户名（可选）</label>
+                <input type="text" id="net_upstream_username" class="input-field" maxlength="255" autocomplete="off">
+              </div>
+              <div class="form-group" style="margin-bottom:12px;">
+                <label class="form-label" for="net_upstream_password">密码（可选）</label>
+                <input type="password" id="net_upstream_password" class="input-field" maxlength="255" autocomplete="new-password" placeholder="留空则保持不变">
+              </div>
+            </div>
+
+            <label style="display:flex; align-items:flex-start; gap:8px; margin-bottom:10px; cursor:pointer; font-size:12px; color:var(--text-secondary); line-height:1.4;">
+              <input type="checkbox" id="net_upstream_use_openvpn" style="margin-top:2px; accent-color:var(--primary);">
+              <span>同时用于 OpenVPN 的 TCP 节点连接。默认关闭，避免 VPN 流量无意绕行上游代理。</span>
+            </label>
+            <label id="net_upstream_clear_password_row" style="display:none; align-items:center; gap:8px; cursor:pointer; font-size:12px; color:var(--text-secondary);">
+              <input type="checkbox" id="net_upstream_clear_password" style="accent-color:var(--danger);">
+              清除已保存的代理密码
+            </label>
+          </div>
         </div>
 
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
@@ -4546,6 +4602,26 @@ async function saveCredentials(e) {
   }
 }
 
+function updateUpstreamPortDefault() {
+  const type = $("net_upstream_type").value;
+  const portInput = $("net_upstream_port");
+  const current = parseInt(portInput.value);
+  if (!current || current === 8080 || current === 1080) {
+    portInput.value = type === "socks" ? 1080 : 8080;
+  }
+}
+
+function toggleUpstreamFields() {
+  const upstream = (state && state.upstream_proxy) || {};
+  const managed = !!upstream.managed_by_environment;
+  const enabled = $("net_upstream_enabled").checked;
+  $("net_upstream_enabled").disabled = managed;
+  $("net_upstream_env_notice").style.display = managed ? "block" : "none";
+  $("net_upstream_fields").querySelectorAll("input, select").forEach(el => {
+    el.disabled = managed || !enabled;
+  });
+}
+
 function openNetworkModal() {
   $("network_error").style.display = "none";
   $("network_success").style.display = "none";
@@ -4555,11 +4631,24 @@ function openNetworkModal() {
     $("net_proxy_port").value = state.proxy_port || 7928;
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
+    const upstream = state.upstream_proxy || {};
+
+    $("net_upstream_enabled").checked = !!upstream.enabled;
+    $("net_upstream_type").value = upstream.type || "http";
+    $("net_upstream_host").value = upstream.host || "";
+    $("net_upstream_port").value = upstream.port || (upstream.type === "socks" ? 1080 : 8080);
+    $("net_upstream_username").value = upstream.username || "";
+    $("net_upstream_password").value = "";
+    $("net_upstream_password").placeholder = upstream.password_set ? "已保存；留空则保持不变" : "未设置密码";
+    $("net_upstream_use_openvpn").checked = !!upstream.use_for_openvpn;
+    $("net_upstream_clear_password").checked = false;
+    $("net_upstream_clear_password_row").style.display = upstream.password_set ? "flex" : "none";
     
     selectOptionCard('routing_mode', mode);
     selectOptionCard('routing_ip_type', ipType);
   }
   
+  toggleUpstreamFields();
   populateRoutingCountries();
   $("network_modal").style.display = "flex";
   $("admin_dropdown").style.display = "none";
@@ -4582,6 +4671,42 @@ async function saveNetwork(e) {
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
+  const upstreamStatus = (state && state.upstream_proxy) || {};
+  let upstreamPayload = null;
+
+  if (!upstreamStatus.managed_by_environment) {
+    const upstreamEnabled = $("net_upstream_enabled").checked;
+    const upstreamType = $("net_upstream_type").value;
+    const upstreamHost = $("net_upstream_host").value.trim();
+    const upstreamPort = parseInt($("net_upstream_port").value);
+    const upstreamUsername = $("net_upstream_username").value.trim();
+    const upstreamPassword = $("net_upstream_password").value;
+    if (upstreamEnabled && !upstreamHost) {
+      errorDivEl.textContent = "启用上游代理时必须填写主机或 IP";
+      errorDivEl.style.display = "block";
+      return;
+    }
+    if (isNaN(upstreamPort) || upstreamPort < 1 || upstreamPort > 65535) {
+      errorDivEl.textContent = "上游代理端口范围必须在 1 至 65535 之间";
+      errorDivEl.style.display = "block";
+      return;
+    }
+    if (upstreamPassword && !upstreamUsername) {
+      errorDivEl.textContent = "填写上游代理密码时必须同时填写用户名";
+      errorDivEl.style.display = "block";
+      return;
+    }
+    upstreamPayload = {
+      enabled: upstreamEnabled,
+      type: upstreamType,
+      host: upstreamHost,
+      port: upstreamPort,
+      username: upstreamUsername,
+      password: upstreamPassword,
+      clear_password: $("net_upstream_clear_password").checked,
+      use_for_openvpn: $("net_upstream_use_openvpn").checked
+    };
+  }
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -4617,7 +4742,8 @@ async function saveNetwork(e) {
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+        routing_ip_type: routingIpType,
+        upstream_proxy: upstreamPayload
       })
     });
     
@@ -5476,6 +5602,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                upstream_payload = payload.get("upstream_proxy")
                 
                 try:
                     new_proxy_port_int = int(new_proxy_port)
@@ -5494,6 +5621,39 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_ip_type not in ("all", "residential", "hosting"):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
+
+                upstream_changed = False
+                if upstream_payload is not None:
+                    if not isinstance(upstream_payload, dict):
+                        self.send_json({"ok": False, "error": "上游代理配置必须是对象"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if vpn_utils.get_upstream_proxy_status().get("managed_by_environment"):
+                        self.send_json(
+                            {"ok": False, "error": "上游代理当前由环境变量管理，请先移除对应环境变量后再使用网页配置"},
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+                    current_upstream = vpn_utils.load_upstream_proxy_settings()
+                    candidate_upstream = {
+                        "enabled": bool(upstream_payload.get("enabled", False)),
+                        "type": str(upstream_payload.get("type") or "http"),
+                        "host": str(upstream_payload.get("host") or ""),
+                        "port": upstream_payload.get("port"),
+                        "username": str(upstream_payload.get("username") or ""),
+                        "password": current_upstream.get("password", ""),
+                        "use_for_openvpn": bool(upstream_payload.get("use_for_openvpn", False)),
+                    }
+                    new_upstream_password = str(upstream_payload.get("password") or "")
+                    if bool(upstream_payload.get("clear_password", False)):
+                        candidate_upstream["password"] = ""
+                    elif new_upstream_password:
+                        candidate_upstream["password"] = new_upstream_password
+                    try:
+                        normalized_upstream = vpn_utils.normalize_upstream_proxy_settings(candidate_upstream)
+                    except ValueError as exc:
+                        self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
+                    upstream_changed = normalized_upstream != current_upstream
                 
                 ui_cfg = load_ui_config()
                 expected_proxy_port = ui_cfg.get("proxy_port", 7928)
@@ -5519,6 +5679,15 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
+                if upstream_payload is not None:
+                    vpn_utils.save_upstream_proxy_settings(normalized_upstream)
+                    if upstream_changed:
+                        proxy_label = (
+                            f"{normalized_upstream['type']}://{normalized_upstream['host']}:{normalized_upstream['port']}"
+                            if normalized_upstream["enabled"]
+                            else "已禁用"
+                        )
+                        log_to_json("INFO", "Main", f"网页上游代理配置已更新: {proxy_label}")
 
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
                 
@@ -5534,7 +5703,12 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=restart_server, daemon=True).start()
                 else:
                     message = policy_message or "配置更新成功，已即时生效！"
-                    self.send_json({"ok": True, "restart_needed": False, "message": message})
+                    self.send_json({
+                        "ok": True,
+                        "restart_needed": False,
+                        "message": message,
+                        "upstream_proxy": vpn_utils.get_upstream_proxy_status(),
+                    })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return

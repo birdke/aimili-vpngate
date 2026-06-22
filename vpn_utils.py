@@ -15,8 +15,10 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
+UPSTREAM_PROXY_CONFIG_FILE = DATA_DIR / "upstream_proxy.json"
 
 ip_cache_lock = threading.RLock()
+upstream_proxy_lock = threading.RLock()
 
 COUNTRY_TRANSLATIONS = {
     "Japan": "日本",
@@ -133,43 +135,173 @@ def _proxy_config_from_env(env_name: str, forced_type: str | None = None) -> tup
         return forced_type or "http", host, port, None, None
     return None
 
-def get_upstream_proxy_config() -> tuple[str | None, str | None, int | None, str | None, str | None]:
-    for env_name, forced_type in [
+def normalize_upstream_proxy_settings(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        data = {}
+    enabled = bool(data.get("enabled", False))
+    proxy_type = str(data.get("type") or "http").strip().lower()
+    if proxy_type not in ("http", "socks"):
+        raise ValueError("上游代理类型只能是 HTTP 或 SOCKS5")
+
+    host = str(data.get("host") or "").strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1].strip()
+    if len(host) > 253 or any(ch.isspace() for ch in host) or "://" in host or "/" in host:
+        raise ValueError("上游代理主机格式无效，请只填写域名或 IP")
+
+    default_port = 8080 if proxy_type == "http" else 1080
+    port = _safe_int(data.get("port"), default_port)
+    if not (1 <= port <= 65535):
+        raise ValueError("上游代理端口范围必须是 1 至 65535")
+    if enabled and not host:
+        raise ValueError("启用上游代理时必须填写主机")
+
+    username = str(data.get("username") or "").strip()
+    password = str(data.get("password") or "")
+    if len(username.encode("utf-8")) > 255 or len(password.encode("utf-8")) > 255:
+        raise ValueError("上游代理用户名和密码均不能超过 255 字节")
+    if password and not username:
+        raise ValueError("填写上游代理密码时必须同时填写用户名")
+
+    return {
+        "enabled": enabled,
+        "type": proxy_type,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "use_for_openvpn": bool(data.get("use_for_openvpn", False)),
+    }
+
+def load_upstream_proxy_settings() -> dict[str, Any]:
+    defaults = normalize_upstream_proxy_settings({})
+    with upstream_proxy_lock:
+        try:
+            raw = json.loads(UPSTREAM_PROXY_CONFIG_FILE.read_text(encoding="utf-8"))
+            return normalize_upstream_proxy_settings(raw)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            return defaults
+
+def save_upstream_proxy_settings(data: Any) -> dict[str, Any]:
+    normalized = normalize_upstream_proxy_settings(data)
+    with upstream_proxy_lock:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        tmp_path = UPSTREAM_PROXY_CONFIG_FILE.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, UPSTREAM_PROXY_CONFIG_FILE)
+        try:
+            UPSTREAM_PROXY_CONFIG_FILE.chmod(0o600)
+        except OSError:
+            pass
+    return normalized
+
+def _first_env_proxy(entries: list[tuple[str, str | None]]) -> tuple[str, str, int, str | None, str | None] | None:
+    for env_name, forced_type in entries:
+        cfg = _proxy_config_from_env(env_name, forced_type)
+        if cfg:
+            return cfg
+    return None
+
+def _get_upstream_proxy_config_with_source(
+    purpose: str = "api",
+) -> tuple[tuple[str, str, int, str | None, str | None] | None, str]:
+    explicit_env = _first_env_proxy([
         ("OPENVPN_UPSTREAM_SOCKS", "socks"),
         ("OPENVPN_UPSTREAM_HTTP", "http"),
+    ])
+    if explicit_env:
+        return explicit_env, "environment"
+
+    settings = load_upstream_proxy_settings()
+    if settings["enabled"]:
+        if purpose != "openvpn" or settings["use_for_openvpn"]:
+            username = settings["username"] or None
+            password = settings["password"] if username is not None else None
+            return (
+                settings["type"],
+                settings["host"],
+                settings["port"],
+                username,
+                password,
+            ), "web"
+        return None, "none"
+
+    generic_env = _first_env_proxy([
         ("http_proxy", None),
         ("HTTP_PROXY", None),
         ("https_proxy", None),
         ("HTTPS_PROXY", None),
-    ]:
-        cfg = _proxy_config_from_env(env_name, forced_type)
-        if cfg:
-            ptype, host, port, username, password = cfg
-            return ptype, host, port, username, password
-    return None, None, None, None, None
+    ])
+    if generic_env:
+        return generic_env, "environment"
+    return None, "none"
 
-def get_upstream_proxy() -> tuple[str | None, str | None, int | None]:
+def get_upstream_proxy_config(
+    purpose: str = "api",
+) -> tuple[str | None, str | None, int | None, str | None, str | None]:
+    cfg, _ = _get_upstream_proxy_config_with_source(purpose)
+    return cfg if cfg else (None, None, None, None, None)
+
+def get_upstream_proxy(purpose: str = "api") -> tuple[str | None, str | None, int | None]:
     """
     Returns (proxy_type, host, port) from environment variables.
     proxy_type is 'socks' or 'http'.
     """
-    ptype, host, port, _, _ = get_upstream_proxy_config()
+    ptype, host, port, _, _ = get_upstream_proxy_config(purpose)
     return ptype, host, port
 
-def get_upstream_proxy_auth() -> tuple[str | None, str | None]:
+def get_upstream_proxy_auth(purpose: str = "api") -> tuple[str | None, str | None]:
     """
     Returns optional (username, password) for the configured upstream proxy.
     Supports credentials embedded in proxy URLs and explicit env vars.
     """
-    _, _, _, username, password = get_upstream_proxy_config()
+    cfg, source = _get_upstream_proxy_config_with_source(purpose)
+    _, _, _, username, password = cfg if cfg else (None, None, None, None, None)
     if username is not None:
         return username, password or ""
 
-    user = os.environ.get("OPENVPN_UPSTREAM_USER") or os.environ.get("OPENVPN_UPSTREAM_USERNAME")
-    password = os.environ.get("OPENVPN_UPSTREAM_PASS") or os.environ.get("OPENVPN_UPSTREAM_PASSWORD")
-    if user is not None:
-        return user, password or ""
+    if source == "environment":
+        user = os.environ.get("OPENVPN_UPSTREAM_USER") or os.environ.get("OPENVPN_UPSTREAM_USERNAME")
+        env_password = os.environ.get("OPENVPN_UPSTREAM_PASS") or os.environ.get("OPENVPN_UPSTREAM_PASSWORD")
+        if user is not None:
+            return user, env_password or ""
     return None, None
+
+def get_upstream_proxy_status() -> dict[str, Any]:
+    cfg, source = _get_upstream_proxy_config_with_source("api")
+    file_settings = load_upstream_proxy_settings()
+    if cfg:
+        proxy_type, host, port, username, password = cfg
+        if source == "environment" and username is None:
+            username = os.environ.get("OPENVPN_UPSTREAM_USER") or os.environ.get("OPENVPN_UPSTREAM_USERNAME")
+            password = os.environ.get("OPENVPN_UPSTREAM_PASS") or os.environ.get("OPENVPN_UPSTREAM_PASSWORD")
+        use_for_openvpn = True if source == "environment" else file_settings["use_for_openvpn"]
+        return {
+            "enabled": True,
+            "type": proxy_type,
+            "host": host,
+            "port": port,
+            "username": username or "",
+            "password_set": password is not None and password != "",
+            "use_for_openvpn": use_for_openvpn,
+            "source": source,
+            "managed_by_environment": source == "environment",
+        }
+    return {
+        "enabled": False,
+        "type": file_settings["type"],
+        "host": file_settings["host"],
+        "port": file_settings["port"],
+        "username": file_settings["username"],
+        "password_set": bool(file_settings["password"]),
+        "use_for_openvpn": file_settings["use_for_openvpn"],
+        "source": "none",
+        "managed_by_environment": False,
+    }
 
 def is_config_tcp(config_text: str) -> bool:
     try:

@@ -2,7 +2,7 @@
 
 Bilingual: [中文](#中文) | [English](#english)
 
-> 本 Fork 由 [birdke](https://github.com/birdke) 维护，基于 [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate)。当前版本新增受限 VPNGate API 中继、严格响应校验和失败退避，适合官方节点 API 对部分 VPS 出口 IP 返回空 HTML 的场景。
+> 本 Fork 由 [birdke](https://github.com/birdke) 维护，基于 [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate)。当前版本新增网页上游代理配置、严格 API 响应校验和失败退避，适合官方节点 API 对部分 VPS 出口 IP 返回空 HTML 的场景。
 
 ---
 
@@ -42,52 +42,23 @@ bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/ins
 ```
 > 💡 **小贴士**：部署完成后，终端会输出管理网页的专属链接（含随机安全后缀，如 `http://your_vps_ip:8787/u71e9IXp4TPx`）。在终端中输入 `ml` 命令可以随时调出交互式命令行管理菜单。
 
-#### 🌉 使用另一台 VPS 中继节点列表 API
+#### 🌐 在网页配置上游代理
 
-当 VPNGate 对当前 VPS 的出口 IP 返回空 HTML 时，可以在另一台能正常获取 CSV 的 VPS 上运行受限中继。中继只提供节点列表，不会转发 OpenVPN 流量。
+如果 VPNGate 对当前 VPS 返回空 HTML，可以直接在管理后台配置一个可用的 HTTP 或 SOCKS5 上游代理：
 
-在美国 VPS 上：
+1. 打开 **管理员 → 代理设置**，启用“上游代理”。
+2. 选择 HTTP 或 SOCKS5，填写主机、端口及可选的用户名和密码。
+3. 默认只代理节点列表 API；除非确实需要，否则不要勾选“同时用于 OpenVPN 的 TCP 节点连接”。
+4. 保存后点击 **更新节点**。配置即时生效，无需重启服务。
 
-```bash
-if [ -d /opt/aimilivpn/.git ]; then
-  git -C /opt/aimilivpn pull --ff-only
-else
-  git clone https://github.com/birdke/aimili-vpngate.git /opt/aimilivpn
-fi
-cd /opt/aimilivpn
-read -rp "香港 VPS 公网 IPv4: " HK_IP
-TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
-cp deploy/aimilivpn-api-relay.env.example /etc/default/aimilivpn-api-relay
-sed -i "s/replace-with-a-long-random-token/$TOKEN/" /etc/default/aimilivpn-api-relay
-sed -i "s/203.0.113.10/$HK_IP/" /etc/default/aimilivpn-api-relay
-cp deploy/aimilivpn-api-relay.service /etc/systemd/system/
-chmod 600 /etc/default/aimilivpn-api-relay
-systemctl daemon-reload
-systemctl enable --now aimilivpn-api-relay
-curl -fsS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/api/iphone/ | head -n 2
-echo "保存此令牌供香港端使用: $TOKEN"
-```
+代理凭据保存在 VPS 本机的 `vpngate_data/upstream_proxy.json`，文件权限为 `600`；管理接口只返回“是否已设置密码”，不会把密码发回浏览器。
 
-在云防火墙或 UFW 中只允许香港 VPS 访问美国 VPS 的 TCP `8790` 端口。然后在香港 VPS 执行：
+<details>
+<summary>高级备用：自建节点 API 中继</summary>
 
-```bash
-read -rp "美国 VPS 公网 IP: " US_IP
-read -rsp "美国中继令牌: " RELAY_TOKEN; echo
-touch /etc/default/aimilivpn
-sed -i '/^VPNGATE_API_URL=/d; /^VPNGATE_API_TOKEN=/d' /etc/default/aimilivpn
-printf 'VPNGATE_API_URL=http://%s:8790/api/iphone/\n' "$US_IP" >> /etc/default/aimilivpn
-printf 'VPNGATE_API_TOKEN=%s\n' "$RELAY_TOKEN" >> /etc/default/aimilivpn
-```
+如果没有现成代理，也可以在另一台能访问 VPNGate 的 VPS 上运行 `vpngate_api_relay.py`。中继带令牌、源 IP 限制和缓存，仅提供公开节点 CSV，不转发 VPN 流量。部署模板位于 `deploy/` 目录。
 
-重启香港端并观察日志：
-
-```bash
-chmod 600 /etc/default/aimilivpn
-systemctl restart aimilivpn
-journalctl -u aimilivpn -f
-```
-
-> 安全提示：中继不是通用代理，但仍应同时使用令牌和源 IP 防火墙限制。跨公网使用时，推荐再通过 TLS 反向代理或 SSH 隧道保护传输。
+</details>
 
 ---
 
@@ -163,7 +134,8 @@ journalctl -u aimilivpn -f
 #### 3. 页面提示 `API Domain Blocked` 且备选节点显示为 0
 * **原因**：您的 VPS DNS 解析异常、官方域名被阻断，或者 VPNGate 针对当前 VPS 出口 IP 返回了空 HTML 而不是节点 CSV。
 * **解决办法**：
-  * 如果请求成功但返回 HTML，请使用上文的 **节点列表 API 中继**；它只中继公开 CSV，不会让 OpenVPN 流量绕行中继 VPS。
+  * 如果请求成功但返回 HTML，请在 **管理员 → 代理设置** 中配置 HTTP/SOCKS5 上游代理，默认只用于节点 API。
+  * 如果没有可用代理，可使用上文折叠说明中的自建 API 中继作为备用。
   * 如果日志显示域名无法解析，再检查 `/etc/resolv.conf` 或系统 DNS 配置。不要在 DNS 正常时盲目更换解析器。
 
 #### 4. VPN 已成功连接，但客户端设置代理后无法上网 (无流量)
@@ -186,7 +158,7 @@ journalctl -u aimilivpn -f
 <a name="english"></a>
 ## English
 
-> This fork is maintained by [birdke](https://github.com/birdke) and is based on [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate). It adds a restricted VPNGate API relay, strict response validation, and failure backoff for VPS addresses that receive an empty HTML response instead of the node CSV.
+> This fork is maintained by [birdke](https://github.com/birdke) and is based on [baoweise-bot/aimili-vpngate](https://github.com/baoweise-bot/aimili-vpngate). It adds Web-managed upstream proxies, strict API response validation, and failure backoff for VPS addresses that receive an empty HTML response instead of the node CSV.
 
 AimiliVPN is a high-performance, zero-dependency VPN proxy gateway built entirely using Python's standard library. It parses official VPNGate servers, benchmarks latency, and routes traffic through a built-in dual-protocol (HTTP/SOCKS5) proxy server.
 
@@ -219,9 +191,11 @@ bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/ins
 
 > 💡 **Quick Note**: Once installed, copy the printed URL from the terminal to access the Web UI. Type the `ml` command in the terminal to summon the interactive CLI management console.
 
-#### 🌉 Relay the node-list API through another VPS
+#### 🌐 Configure an upstream proxy in the Web UI
 
-If VPNGate returns an empty HTML page to the gateway VPS, run `vpngate_api_relay.py` on another VPS that can fetch the official CSV. The relay is token-protected, cached, optionally source-IP restricted, and never proxies OpenVPN traffic. See `deploy/aimilivpn-api-relay.service` and `deploy/aimilivpn-api-relay.env.example`; configure the gateway with `VPNGATE_API_URL` and `VPNGATE_API_TOKEN` in `/etc/default/aimilivpn`.
+If VPNGate returns an empty HTML page, open **Admin → Proxy Settings**, enable the upstream proxy, and enter an HTTP or SOCKS5 endpoint with optional credentials. It applies to node-list API requests immediately and does not require a restart. OpenVPN TCP connections remain direct unless the corresponding option is explicitly enabled.
+
+Credentials are stored locally in `vpngate_data/upstream_proxy.json` with mode `600`; the API never returns the stored password. The restricted `vpngate_api_relay.py` remains available under `deploy/` as an advanced fallback when no proxy is available.
 
 ---
 
@@ -275,7 +249,7 @@ To prevent unauthorized scanning and abuse of the proxy port on the public inter
 
 #### 3. "API Domain Blocked" / Candidate nodes pool is empty (0 nodes)
 * **Reason**: DNS may be broken, the official domain may be blocked, or VPNGate may return an empty HTML page instead of CSV to the VPS egress address.
-* **Solution**: If HTTP succeeds but returns HTML, use the **node-list API relay** described above. If name resolution fails, inspect the system resolver configuration before changing DNS servers.
+* **Solution**: If HTTP succeeds but returns HTML, configure an HTTP/SOCKS5 upstream proxy under **Admin → Proxy Settings**. If no proxy is available, use the restricted API relay as an advanced fallback. If name resolution fails, inspect the system resolver configuration before changing DNS servers.
 
 ---
 
