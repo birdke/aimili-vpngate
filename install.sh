@@ -1051,6 +1051,7 @@ cfg = {
     "host": "::",
     "port": int(ui_port),
     "proxy_port": 7928,
+    "tun_interface": "aimili0",
     "secret_path": secret_path,
     "username": username,
     "password": password,

@@ -129,6 +129,12 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+try:
+    ENV_TUN_INTERFACE = vpn_utils.get_tun_interface_from_env()
+except ValueError as exc:
+    print(f"[配置警告] TUN 网卡环境变量无效: {exc}，使用默认值 {vpn_utils.DEFAULT_TUN_INTERFACE}", flush=True)
+    ENV_TUN_INTERFACE = None
+DEFAULT_TUN_INTERFACE = ENV_TUN_INTERFACE or vpn_utils.DEFAULT_TUN_INTERFACE
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -236,7 +242,8 @@ def load_ui_config() -> dict[str, Any]:
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
-            "fav_fail_fallback": False
+            "fav_fail_fallback": False,
+            "tun_interface": DEFAULT_TUN_INTERFACE
         }
         updated = False
         if auth_file.exists():
@@ -244,7 +251,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "tun_interface"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -272,6 +279,17 @@ def load_ui_config() -> dict[str, Any]:
         if normalized_proxy_port != config.get("proxy_port"):
             config["proxy_port"] = normalized_proxy_port
             updated = True
+
+        try:
+            normalized_tun_interface = vpn_utils.normalize_tun_interface_name(
+                config.get("tun_interface"),
+                DEFAULT_TUN_INTERFACE,
+            )
+        except ValueError:
+            normalized_tun_interface = DEFAULT_TUN_INTERFACE
+        if normalized_tun_interface != config.get("tun_interface"):
+            config["tun_interface"] = normalized_tun_interface
+            updated = True
             
         if not auth_file.exists() or updated:
             try:
@@ -293,6 +311,22 @@ try:
         UI_HOST = _init_cfg["host"]
 except Exception:
     pass
+
+def get_vpn_interface(ui_cfg: dict[str, Any] | None = None) -> str:
+    if ENV_TUN_INTERFACE:
+        return ENV_TUN_INTERFACE
+    if ui_cfg is None:
+        ui_cfg = load_ui_config()
+    try:
+        return vpn_utils.normalize_tun_interface_name(
+            ui_cfg.get("tun_interface"),
+            DEFAULT_TUN_INTERFACE,
+        )
+    except ValueError:
+        return DEFAULT_TUN_INTERFACE
+
+def test_vpn_interface_name(idx: int) -> str:
+    return vpn_utils.normalize_tun_interface_name(f"aimili{idx}")
 
 def get_session_token(password: str, username: str = "admin") -> str:
     salt = "aimilivpn_secure_salt_2026"
@@ -390,6 +424,8 @@ def get_state() -> dict[str, Any]:
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["fav_fail_fallback"] = False
     state["upstream_proxy"] = vpn_utils.get_upstream_proxy_status()
+    state["tun_interface"] = get_vpn_interface(ui_cfg)
+    state["tun_interface_source"] = "environment" if ENV_TUN_INTERFACE else "web"
     
     return state
 
@@ -866,7 +902,8 @@ def get_openvpn_version() -> float:
     _openvpn_version = 2.4
     return _openvpn_version
 
-def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> list[str]:
+def openvpn_command(config_file: str, route_nopull: bool, dev: str | None = None) -> list[str]:
+    dev = dev or get_vpn_interface()
     command = split_openvpn_command()
     command.extend(
         [
@@ -1009,7 +1046,8 @@ def update_handshake_status(line_lower: str) -> None:
             set_state(active_node_latency=short_status, last_check_message=detailed_desc)
             break
 
-def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str = "tun0") -> tuple[bool, str, subprocess.Popen[str] | None]:
+def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bool, timeout: int | None = None, dev: str | None = None) -> tuple[bool, str, subprocess.Popen[str] | None]:
+    dev = dev or get_vpn_interface()
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
@@ -1096,7 +1134,7 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
         log_to_json(level, "VPN", f"[OpenVPN] {line_str}")
 
     if not ok:
-        err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail)
+        err_code, diag_msg = vpn_utils.diagnose_openvpn_failure(tail, dev)
         message = f"[错误代码 {err_code}] {diag_msg} (原始日志尾部: {tail[-1][-100:] if tail else '无'})"
     startup_done[0] = True
     if not keep_alive or not ok:
@@ -1105,7 +1143,8 @@ def run_openvpn_until_ready(config_file: str, keep_alive: bool, route_nopull: bo
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> None:
+def setup_policy_routing(interface: str | None = None) -> None:
+    interface = interface or get_vpn_interface()
     try:
         subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
     except Exception:
@@ -1373,7 +1412,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     idx = None
     try:
         idx = get_free_test_index()
-        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=f"tun{idx}")
+        ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=test_vpn_interface_name(idx))
     finally:
         if idx is not None:
             release_test_index(idx)
@@ -1464,7 +1503,7 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         tun_idx = None
         try:
             tun_idx = get_free_test_index()
-            dev_name = f"tun{tun_idx}"
+            dev_name = test_vpn_interface_name(tun_idx)
             ok, message, _ = run_openvpn_until_ready(str(temp_path), keep_alive=False, route_nopull=True, timeout=12, dev=dev_name)
         finally:
             if tun_idx is not None:
@@ -1626,6 +1665,7 @@ def connect_node(node_id: str) -> str:
         
         ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, ui_cfg)
+        tun_interface = get_vpn_interface(ui_cfg)
         ui_cfg["connection_enabled"] = True
         if ui_cfg.get("routing_mode") == "fixed_ip":
             ui_cfg["fixed_node_id"] = node_id
@@ -1647,7 +1687,7 @@ def connect_node(node_id: str) -> str:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
-        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True)
+        ok, message, process = run_openvpn_until_ready(str(node["config_file"]), keep_alive=True, route_nopull=True, dev=tun_interface)
         if not ok or process is None:
             try:
                 if config_path.exists():
@@ -1671,7 +1711,7 @@ def connect_node(node_id: str) -> str:
             active_openvpn_node_id = node_id
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        setup_policy_routing("tun0")
+        setup_policy_routing(tun_interface)
         
         global last_active_ping_time, last_active_latency
         last_active_ping_time = time.time()
@@ -1714,7 +1754,7 @@ def connect_node(node_id: str) -> str:
             
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
         set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
-        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 {tun_interface} 已启用")
         return f"Connected {node_id}"
     except Exception as exc:
         if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):
@@ -3386,6 +3426,17 @@ INDEX_HTML = r"""<!doctype html>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
         </div>
 
+        <div class="form-group" style="margin-bottom: 16px;">
+          <label class="form-label" for="net_tun_interface">VPN 虚拟网卡名称</label>
+          <input type="text" id="net_tun_interface" class="input-field" maxlength="15" pattern="[A-Za-z0-9_.-]+" placeholder="aimili0">
+          <div style="font-size: 11px; color: var(--text-secondary); line-height: 1.45; margin-top: 6px;">
+            默认使用 <code>aimili0</code>，用于避开 sing-box / mihomo 等常用的 <code>tun0</code>。如果与其他 TUN 服务冲突，可改成 <code>aimili1</code> 等未占用名称；保存后会重启服务生效。
+          </div>
+          <div id="net_tun_env_notice" style="display:none; font-size:12px; line-height:1.4; padding:8px 12px; margin-top:8px; border-radius:6px; color:var(--warning); background:rgba(245,158,11,0.08); border:1px solid rgba(245,158,11,0.18);">
+            当前 VPN 网卡名称由环境变量管理，请移除 VPNGATE_TUN_INTERFACE / AIMILI_TUN_INTERFACE 后再通过网页修改。
+          </div>
+        </div>
+
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
           <label style="display:flex; align-items:center; justify-content:space-between; gap:12px; cursor:pointer; margin-bottom:12px;">
             <span>
@@ -4626,9 +4677,15 @@ function openNetworkModal() {
   $("network_error").style.display = "none";
   $("network_success").style.display = "none";
   $("network_form").reset();
+  $("net_tun_interface").disabled = false;
+  $("net_tun_env_notice").style.display = "none";
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
+    $("net_tun_interface").value = state.tun_interface || "aimili0";
+    const tunManaged = state.tun_interface_source === "environment";
+    $("net_tun_interface").disabled = tunManaged;
+    $("net_tun_env_notice").style.display = tunManaged ? "block" : "none";
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
     const upstream = state.upstream_proxy || {};
@@ -4668,6 +4725,7 @@ async function saveNetwork(e) {
   successDiv.style.display = "none";
   
   const proxyPort = parseInt($("net_proxy_port").value);
+  const tunInterface = ($("net_tun_interface").value || "aimili0").trim();
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
@@ -4714,6 +4772,12 @@ async function saveNetwork(e) {
     return;
   }
 
+  if (!/^[A-Za-z0-9_.-]{1,15}$/.test(tunInterface) || tunInterface.startsWith("-") || [".", "..", "all", "default"].includes(tunInterface)) {
+    errorDivEl.textContent = "VPN 虚拟网卡名称必须为 1-15 位字母/数字/._-，且不能使用系统保留名称";
+    errorDivEl.style.display = "block";
+    return;
+  }
+
   if (state && proxyPort === state.port) {
     errorDivEl.textContent = "代理出站端口不能与网页管理端口相同";
     errorDivEl.style.display = "block";
@@ -4740,6 +4804,7 @@ async function saveNetwork(e) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         proxy_port: proxyPort,
+        tun_interface: tunInterface,
         routing_mode: routingMode,
         force_country: forceCountry,
         routing_ip_type: routingIpType,
@@ -4750,7 +4815,7 @@ async function saveNetwork(e) {
     const data = await res.json();
     if (res.ok && data.ok) {
       if (data.restart_needed) {
-        successDiv.textContent = "保存成功！代理出站端口已变更，页面将在 4 秒内自动刷新...";
+        successDiv.textContent = data.message || "保存成功！服务配置已变更，页面将在 4 秒内自动刷新...";
         successDiv.style.display = "block";
         
         const inputs = $("network_form").querySelectorAll("input, button");
@@ -5019,7 +5084,7 @@ def check_proxy_health() -> dict[str, Any]:
             else:
                 raise e
     except Exception as e:
-        diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
+        diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST, tun_interface=get_vpn_interface())
         diag_msg = diag[1] if diag else f"端口 {LOCAL_PROXY_PORT} 连接失败，原因: {e}"
         return {
             "ok": False,
@@ -5032,12 +5097,13 @@ def check_proxy_health() -> dict[str, Any]:
             except Exception:
                 pass
 
-    # 2. 检测虚拟网卡 tun0 是否存在 (Linux 下)
-    tun_path = Path("/sys/class/net/tun0")
+    # 2. 检测 VPN 虚拟网卡是否存在 (Linux 下)
+    tun_interface = get_vpn_interface()
+    tun_path = Path("/sys/class/net") / tun_interface
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
             "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 ({tun_interface}) 未启用，请确保当前已成功连接 VPN 节点"
         }
 
     # 3. 使用 curl 通过本地 SOCKS5 代理接口测试 IP 与实际延迟
@@ -5117,7 +5183,7 @@ def check_proxy_health() -> dict[str, Any]:
                     pass
 
         if not port_still_listening:
-            diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
+            diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST, tun_interface=get_vpn_interface())
             if diag:
                 return {"ok": False, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
             
@@ -5379,7 +5445,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         raise
             except Exception as e:
-                diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST)
+                diag = vpn_utils.diagnose_local_obstructions(LOCAL_PROXY_PORT, host=LOCAL_PROXY_HOST, tun_interface=get_vpn_interface())
                 proxy_err = diag[1] if diag else f"本地代理网关无法连通: {e}"
             finally:
                 if s is not None:
@@ -5399,8 +5465,9 @@ class Handler(BaseHTTPRequestHandler):
             if ovpn_ok:
                 ovpn_details = f"已连接节点: {active_openvpn_node_id}"
                 if sys.platform.startswith("linux"):
-                    if not Path("/sys/class/net/tun0").exists():
-                        ovpn_err = "[警告] 虚拟网卡 (tun0) 未启用，可能存在策略路由配置问题。"
+                    tun_interface = get_vpn_interface()
+                    if not (Path("/sys/class/net") / tun_interface).exists():
+                        ovpn_err = f"[警告] 虚拟网卡 ({tun_interface}) 未启用，可能存在策略路由配置问题。"
             else:
                 if active_openvpn_node_id:
                     ovpn_err = "连接已中断或 OpenVPN 核心程序异常退出。"
@@ -5599,6 +5666,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body()
                 
                 new_proxy_port = payload.get("proxy_port")
+                requested_tun_interface = payload.get("tun_interface")
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = str(payload.get("force_country") or "").strip()
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
@@ -5657,7 +5725,28 @@ class Handler(BaseHTTPRequestHandler):
                 
                 ui_cfg = load_ui_config()
                 expected_proxy_port = ui_cfg.get("proxy_port", 7928)
+                expected_tun_interface = get_vpn_interface(ui_cfg)
                 fixed_node_id = current_fixed_node_id(ui_cfg) if routing_mode == "fixed_ip" else ""
+                if ENV_TUN_INTERFACE:
+                    if requested_tun_interface not in (None, "", ENV_TUN_INTERFACE):
+                        try:
+                            requested_env_tun = vpn_utils.normalize_tun_interface_name(requested_tun_interface)
+                        except ValueError as exc:
+                            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                            return
+                        if requested_env_tun != ENV_TUN_INTERFACE:
+                            self.send_json({"ok": False, "error": "VPN 虚拟网卡名称当前由环境变量管理，请先移除环境变量后再通过网页修改"}, HTTPStatus.CONFLICT)
+                            return
+                    new_tun_interface = ENV_TUN_INTERFACE
+                else:
+                    try:
+                        new_tun_interface = vpn_utils.normalize_tun_interface_name(
+                            requested_tun_interface if requested_tun_interface is not None else ui_cfg.get("tun_interface"),
+                            DEFAULT_TUN_INTERFACE,
+                        )
+                    except ValueError as exc:
+                        self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                        return
                 
                 if new_proxy_port_int == ui_cfg.get("port", 8787):
                     self.send_json({"ok": False, "error": "代理出站端口不能与网页管理端口相同"}, HTTPStatus.BAD_REQUEST)
@@ -5667,6 +5756,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 
                 ui_cfg["proxy_port"] = new_proxy_port_int
+                ui_cfg["tun_interface"] = new_tun_interface
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
@@ -5691,13 +5781,20 @@ class Handler(BaseHTTPRequestHandler):
 
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
                 
-                restart_needed = (new_proxy_port_int != expected_proxy_port)
+                tun_interface_changed = (new_tun_interface != expected_tun_interface)
+                if tun_interface_changed:
+                    log_to_json("INFO", "Main", f"VPN 虚拟网卡名称已更新: {expected_tun_interface} -> {new_tun_interface}")
+
+                restart_needed = (new_proxy_port_int != expected_proxy_port) or tun_interface_changed
                 if restart_needed:
-                    self.send_json({"ok": True, "restart_needed": True, "message": "配置更新成功，代理出站端口变更，将在 2 秒内重启..."})
+                    restart_reason = "VPN 虚拟网卡名称变更" if tun_interface_changed else "代理出站端口变更"
+                    self.send_json({"ok": True, "restart_needed": True, "message": f"配置更新成功，{restart_reason}，将在 2 秒内重启..."})
                     
                     def restart_server():
                         time.sleep(2)
-                        print("[系统] 代理出站端口变更，进程即将退出以触发自动重启...", flush=True)
+                        if tun_interface_changed:
+                            stop_active_openvpn()
+                        print(f"[系统] {restart_reason}，进程即将退出以触发自动重启...", flush=True)
                         os._exit(0)
                     
                     threading.Thread(target=restart_server, daemon=True).start()
@@ -5708,6 +5805,7 @@ class Handler(BaseHTTPRequestHandler):
                         "restart_needed": False,
                         "message": message,
                         "upstream_proxy": vpn_utils.get_upstream_proxy_status(),
+                        "tun_interface": get_vpn_interface(ui_cfg),
                     })
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -5939,6 +6037,8 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
+    tun_interface = get_vpn_interface()
+    proxy_server.set_tun_interface(tun_interface)
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -5953,6 +6053,7 @@ def main() -> None:
             "fetch_interval_seconds": FETCH_INTERVAL_SECONDS,
             "check_interval_seconds": CHECK_INTERVAL_SECONDS,
             "local_proxy": f"http://{'[' + LOCAL_PROXY_HOST + ']' if ':' in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}",
+            "tun_interface": tun_interface,
             "active_openvpn_node_id": "",
             "last_fetch_status": "starting",
             "last_check_message": "服务已启动，正在初始化网络并获取候选 VPN 节点...",
@@ -6016,6 +6117,7 @@ def main() -> None:
     
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
+    print(f"VPN interface: {tun_interface}", flush=True)
     DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
 
 if __name__ == "__main__":

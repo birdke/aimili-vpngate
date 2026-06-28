@@ -69,6 +69,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/uni
 
 代理凭据保存在 VPS 本机的 `vpngate_data/upstream_proxy.json`，文件权限为 `600`；管理接口只返回“是否已设置密码”，不会把密码发回浏览器。
 
+#### 🧩 与 sing-box / mihomo 等 TUN 服务共存
+
+新版默认让 VPNGate/OpenVPN 使用 `aimili0` 作为虚拟网卡名称，而不是常见的 `tun0`，用于避开 sing-box 自动创建 `tun0` 时造成的 `Cannot ioctl TUNSETIFF tun0: Device or resource busy` 冲突。
+
+如需自定义，请打开 **管理员 → 代理设置 → VPN 虚拟网卡名称**，填写 1-15 位的网卡名（例如 `aimili1`），保存后服务会自动重启生效。若你通过环境变量 `VPNGATE_TUN_INTERFACE` / `AIMILI_TUN_INTERFACE` / `OPENVPN_TUN_INTERFACE` 指定了网卡名，网页会以只读方式显示当前值。
+
 <details>
 <summary>高级备用：自建节点 API 中继</summary>
 
@@ -222,6 +228,12 @@ Pass `--yes` for a non-interactive purge, then run the one-click installer again
 If VPNGate returns an empty HTML page, open **Admin → Proxy Settings**, enable the upstream proxy, and enter an HTTP or SOCKS5 endpoint with optional credentials. It applies to node-list API requests immediately and does not require a restart. OpenVPN TCP connections remain direct unless the corresponding option is explicitly enabled.
 
 Credentials are stored locally in `vpngate_data/upstream_proxy.json` with mode `600`; the API never returns the stored password. The restricted `vpngate_api_relay.py` remains available under `deploy/` as an advanced fallback when no proxy is available.
+
+#### 🧩 Coexisting with sing-box / mihomo TUN mode
+
+AimiliVPN now uses `aimili0` as the default OpenVPN TUN interface instead of the commonly occupied `tun0`. This avoids failures such as `Cannot ioctl TUNSETIFF tun0: Device or resource busy` when sing-box has already created its own TUN device.
+
+To customize it, open **Admin → Proxy Settings → VPN TUN interface name**, enter a 1-15 character interface name such as `aimili1`, and save. The service restarts automatically so OpenVPN, policy routing, and the built-in proxy all use the same interface. Environment variables `VPNGATE_TUN_INTERFACE`, `AIMILI_TUN_INTERFACE`, or `OPENVPN_TUN_INTERFACE` can also override the Web setting.
 
 ---
 

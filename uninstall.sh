@@ -91,8 +91,29 @@ fi
 
 echo -e "${YELLOW}[3/6] 清理 AimiliVPN 策略路由...${PLAIN}"
 if command -v ip >/dev/null 2>&1; then
-    while ip rule del oif tun0 table 100 >/dev/null 2>&1; do :; done
-    if ip route show table 100 2>/dev/null | grep -qE '(^|[[:space:]])dev tun0([[:space:]]|$)'; then
+    TUN_INTERFACE="aimili0"
+    if [ -f "${INSTALL_DIR}/vpngate_data/ui_auth.json" ] && command -v python3 >/dev/null 2>&1; then
+        TUN_INTERFACE=$(python3 - "${INSTALL_DIR}/vpngate_data/ui_auth.json" <<'PY' 2>/dev/null || echo "aimili0"
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        print(json.load(f).get("tun_interface") or "aimili0")
+except Exception:
+    print("aimili0")
+PY
+)
+    fi
+    flush_table=0
+    for dev in "$TUN_INTERFACE" aimili0 tun0; do
+        [ -n "$dev" ] || continue
+        while ip rule del oif "$dev" table 100 >/dev/null 2>&1; do :; done
+        if ip route show table 100 2>/dev/null | grep -qF "dev $dev"; then
+            flush_table=1
+        fi
+    done
+    if [ "$flush_table" -eq 1 ]; then
         ip route flush table 100 >/dev/null 2>&1 || true
     fi
 fi

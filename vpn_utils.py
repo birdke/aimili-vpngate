@@ -16,9 +16,32 @@ ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
 UPSTREAM_PROXY_CONFIG_FILE = DATA_DIR / "upstream_proxy.json"
+DEFAULT_TUN_INTERFACE = "aimili0"
+TUN_INTERFACE_ENV_NAMES = (
+    "VPNGATE_TUN_INTERFACE",
+    "AIMILI_TUN_INTERFACE",
+    "OPENVPN_TUN_INTERFACE",
+)
 
 ip_cache_lock = threading.RLock()
 upstream_proxy_lock = threading.RLock()
+
+def normalize_tun_interface_name(value: Any, default: str = DEFAULT_TUN_INTERFACE) -> str:
+    name = str(value or "").strip() or default
+    if len(name.encode("utf-8")) > 15:
+        raise ValueError("VPN 虚拟网卡名称最长 15 个字符")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise ValueError("VPN 虚拟网卡名称只能包含字母、数字、点号、下划线和短横线")
+    if name in {".", "..", "all", "default"} or name.startswith("-"):
+        raise ValueError("VPN 虚拟网卡名称不可使用系统保留名称")
+    return name
+
+def get_tun_interface_from_env() -> str | None:
+    for env_name in TUN_INTERFACE_ENV_NAMES:
+        raw = os.environ.get(env_name)
+        if raw:
+            return normalize_tun_interface_name(raw)
+    return None
 
 COUNTRY_TRANSLATIONS = {
     "Japan": "日本",
@@ -698,14 +721,18 @@ def diagnose_api_failure(api_url: str = "https://www.vpngate.net/api/iphone/") -
     return 1010, f"[ERR_API_TLS_INTERFERENCE] HTTPS/TLS 握手被干扰。原因: 可以建立 TCP 连接但请求超时，通常是由于防火墙通过 SNI 阻断了 TLS 握手流。"
 
 
-def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
+def diagnose_openvpn_failure(log_tail: list[str], tun_interface: str | None = None) -> tuple[int, str]:
     joined_log = "\n".join(log_tail).lower()
+    tun_interface = normalize_tun_interface_name(tun_interface or DEFAULT_TUN_INTERFACE)
     
     if "command not found" in joined_log or "no such file or directory" in joined_log:
         return 2001, "[ERR_OVPN_CMD_NOT_FOUND] 未找到 openvpn 命令。原因: 系统中未安装 OpenVPN 软件，或环境变量 PATH 不正确。"
     
+    if "device or resource busy" in joined_log or "errno=16" in joined_log:
+        return 2009, f"[ERR_OVPN_TUN_BUSY] 虚拟网卡 {tun_interface} 已被其他进程占用。原因: sing-box、mihomo、另一个 OpenVPN 实例或其他 TUN 服务已经使用了同名网卡。请在管理后台的代理设置中把 VPN 虚拟网卡名称改成未占用的名称，例如 aimili0、aimili1。"
+
     if "cannot allocate tun" in joined_log or "cannot open tun/tap dev" in joined_log or "cannot ioctl" in joined_log or "cannot allocate tun/tap dev" in joined_log or "dev/net/tun" in joined_log or "operation not permitted" in joined_log:
-        return 2009, "[ERR_OVPN_TUN_NOT_AVAILABLE] 无法创建或访问虚拟网卡 (TUN 设备)。原因: ① 缺少 tun 内核模块；② 当前运行在容器(如 LXC/OpenVZ/Docker)中且宿主机未授予网卡创建权限/未启用 CAP_NET_ADMIN 权限；③ `/dev/net/tun` 文件权限不足；④ 未使用 root 用户运行。如果是 Docker，请添加 `--cap-add=NET_ADMIN` 和 `--device=/dev/net/tun` 参数重新运行。"
+        return 2009, f"[ERR_OVPN_TUN_NOT_AVAILABLE] 无法创建或访问虚拟网卡 {tun_interface} (TUN 设备)。原因: ① 缺少 tun 内核模块；② 当前运行在容器(如 LXC/OpenVZ/Docker)中且宿主机未授予网卡创建权限/未启用 CAP_NET_ADMIN 权限；③ `/dev/net/tun` 文件权限不足；④ 未使用 root 用户运行；⑤ 网卡名称与其他 TUN 服务冲突。如果是 Docker，请添加 `--cap-add=NET_ADMIN` 和 `--device=/dev/net/tun` 参数重新运行。"
         
     if "auth_failed" in joined_log or "authentication failed" in joined_log:
         return 2005, "[ERR_OVPN_AUTH_FAILED] OpenVPN 身份验证失败。原因: 节点配置的用户名密码不正确，或者该免费节点已失效/限制连接。"
@@ -730,8 +757,13 @@ def diagnose_openvpn_failure(log_tail: list[str]) -> tuple[int, str]:
     return 2010, "[ERR_OVPN_UNKNOWN] OpenVPN 其他运行时异常。原因: 连接握手期间发生其他协议错误，详细信息请查看日志尾部。"
 
 
-def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1") -> tuple[int, str] | None:
+def diagnose_local_obstructions(
+    proxy_port: int = 7928,
+    host: str = "127.0.0.1",
+    tun_interface: str | None = None,
+) -> tuple[int, str] | None:
     import sys
+    tun_interface = normalize_tun_interface_name(tun_interface or DEFAULT_TUN_INTERFACE)
     # 1. 检查端口是否被占用
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
@@ -788,7 +820,7 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
         try:
             res = subprocess.run(["systemctl", "is-active", "firewalld"], capture_output=True, text=True, timeout=2)
             if res.returncode == 0 and res.stdout.strip() == "active":
-                return 3007, "[ERR_FIREWALL_BLOCKING_FORWARD] 本机 Firewalld 防火墙正在运行。请确保您已将代理端口及 VPN 网卡(tun0)加入信任区域以避免流量被拦截。"
+                return 3007, f"[ERR_FIREWALL_BLOCKING_FORWARD] 本机 Firewalld 防火墙正在运行。请确保您已将代理端口及 VPN 网卡({tun_interface})加入信任区域以避免流量被拦截。"
         except Exception:
             pass
 
@@ -818,7 +850,7 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
             try:
                 val = rp_all_path.read_text(encoding="utf-8").strip()
                 if val == "1":
-                    return 3008, "[ERR_ROUTE_RP_FILTER_STRICT] 系统启用了严格的反向路径过滤(rp_filter=1)。原因: 在启用策略路由时，严格的路径过滤会导致通过虚拟网卡 tun0 的回包被内核静默丢弃，导致连接超时。请将 net.ipv4.conf.all.rp_filter 设置为 2 或 0。"
+                    return 3008, f"[ERR_ROUTE_RP_FILTER_STRICT] 系统启用了严格的反向路径过滤(rp_filter=1)。原因: 在启用策略路由时，严格的路径过滤会导致通过虚拟网卡 {tun_interface} 的回包被内核静默丢弃，导致连接超时。请将 net.ipv4.conf.all.rp_filter 设置为 2 或 0。"
             except Exception:
                 pass
 
