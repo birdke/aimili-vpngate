@@ -164,6 +164,20 @@ bash <(curl -Ls https://raw.githubusercontent.com/birdke/aimili-vpngate/main/uni
 * **原因**：部分系统启用了严格的反向路径过滤（`rp_filter`），导致策略路由的入站/出站数据包被系统误判丢弃。
 * **解决办法**：在终端输入 `ml` 命令打开交互菜单，工具会自动检测并提示您将 `rp_filter` 修复为宽松模式（值为 `2`）。
 
+#### 5. 使用一段时间后无法上网，但 OpenVPN 仍显示连接正常
+
+OpenVPN 进程存活或节点 IP 能 ping 通，并不代表隧道仍能转发业务流量。出口守护现在通过本机 SOCKS5 代理访问 Google 和 Cloudflare 的 HTTPS 检测地址；任一地址成功即认为出口可用，查 IP 服务异常不会单独触发换节点。
+
+默认每轮结束后等待 15 秒，连续两轮失败后自动恢复。自动、固定地区和收藏模式会在符合当前规则的备用节点中切换；固定 IP 模式只重连原节点。节点测速不会暂停出口检测，新节点也必须通过 HTTPS 检测才能被报告为连接成功。自动切换时，失败节点默认避让 30 分钟；没有备用节点时，后台会继续补充节点和重试。手动断开后不会自动重连。
+
+可在 `/etc/default/aimilivpn` 中设置以下环境变量，重启服务后生效：
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `PROXY_CHECK_INTERVAL_SECONDS` | `15` | 每轮检测结束后的等待秒数 |
+| `PROXY_CHECK_FAILURE_THRESHOLD` | `2` | 触发恢复所需的连续失败轮数 |
+| `PROXY_CHECK_TIMEOUT_SECONDS` | `5` | 单次 HTTPS 请求的超时秒数（1–30） |
+
 ---
 
 ### 🎁 支持上游项目开发
@@ -288,6 +302,14 @@ To prevent unauthorized scanning and abuse of the proxy port on the public inter
 #### 3. "API Domain Blocked" / Candidate nodes pool is empty (0 nodes)
 * **Reason**: DNS may be broken, the official domain may be blocked, or VPNGate may return an empty HTML page instead of CSV to the VPS egress address.
 * **Solution**: If HTTP succeeds but returns HTML, configure an HTTP/SOCKS5 upstream proxy under **Admin → Proxy Settings**. If no proxy is available, use the restricted API relay as an advanced fallback. If name resolution fails, inspect the system resolver configuration before changing DNS servers.
+
+#### 4. OpenVPN looks connected, but Internet access stops working
+
+The watchdog checks actual HTTPS requests to Google and Cloudflare through the local SOCKS5 proxy. Either endpoint succeeding is sufficient; an exit-IP lookup outage alone does not trigger failover. By default, it waits 15 seconds after each round and recovers after two consecutive failures. A dead OpenVPN process triggers recovery immediately on the next round.
+
+Automatic, region and favorites modes choose an eligible backup; fixed-IP mode reconnects the same node. Candidate testing does not suspend the watchdog, and a new connection must pass the HTTPS check before being reported as successful. Automatic failover avoids failed nodes for 30 minutes by default, recovery continues when no node is active, and a manual disconnect disables automatic recovery.
+
+Set `PROXY_CHECK_INTERVAL_SECONDS` (default `15`), `PROXY_CHECK_FAILURE_THRESHOLD` (default `2`), or `PROXY_CHECK_TIMEOUT_SECONDS` (default `5`, range `1–30`) in `/etc/default/aimilivpn` and restart the service to tune these values.
 
 ---
 
